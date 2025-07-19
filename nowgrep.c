@@ -2,6 +2,8 @@
 #define OSTD_IMPL
 #include "One-Std/one-headers/one_system.h"
 #include "One-Std/one-headers/one_print.h"
+#include "One-Std/one-headers/one_math.h"
+#include "One-Std/one-headers/one_unicode.h"
 
 #pragma pack(push,1)
 typedef struct Ntfs_Boot_Sector{
@@ -36,6 +38,9 @@ typedef enum Attribute_Type {
 	ATTR_FILE_NAME = 0x30,
 	ATTR_SECURITY_DESCRIPTOR = 0x50,
 	ATTR_DATA = 0x80,
+	ATTR_INDEX_ROOT = 0x90,
+	
+	ATTR_LOGGED_UTILITY_STREAM = 0x100,
 } Attribute_Type;
 
 typedef struct Attribute_Header_Base {
@@ -115,6 +120,14 @@ FILE_FLAGS_Directory = 0x10000000,
 FILE_FLAGS_Index_View = 0x20000000,
 } File_Flags;
 
+typedef enum File_Record_Flags {
+FILE_RECORD_FLAGS_IN_USE = 0x0001,
+FILE_RECORD_FLAGS_DIRECTORY = 0x0002,
+FILE_RECORD_FLAGS_EXTENSION = 0x0004,
+FILE_RECORD_FLAGS_SPECIAL_INDEX = 0x0020,
+
+} File_Record_Flags;
+
 typedef struct Standard_Information {
 	u64 ctime;
 	u64 atime;
@@ -164,24 +177,20 @@ typedef struct File_Record {
 } File_Record;
 
 typedef struct Disk_Entry {
-	u64 id;
-    u64 parent_id;
+    struct Disk_Entry **pointer_to_parent_entry;
     string name;
     u8 *data; // Valid when resident.
     u64 size; // Size of file data if resident, otherwise size of data run table.
     bool resident; // If resident, offset is to raw data, if non resident, offset is to data runs
     bool is_directory;
+    bool garbage;
 } Disk_Entry;
-
-typedef struct Frn_To_Index_Mapping {
-	u64 frn;
-	u64 index;
-} Frn_To_Index_Mapping;
 
 #pragma pack(pop)
 
 unit_local Ntfs_Boot_Sector *boot;
-unit_local string disk_name;
+unit_local string disk_id;
+unit_local string disk_file_name;
 
 unit_local string search_directory;
 unit_local bool has_search_directory = false;
@@ -203,6 +212,8 @@ unit_local u64 bad_counter = 0;
 
 unit_local u64 match_count = 0;
 unit_local u64 filename_match_count = 0;
+
+unit_local bool is_entire_volume_search = false;
 
 typedef struct Record_Range {
 	u64 first_record_index;
@@ -231,7 +242,7 @@ s64 worker_proc(Thread *t) {
 
 	u16 _cpath[MAX_PATH_LENGTH*2];
     u16 *cpath = _cpath;
-    _win_utf8_to_wide(disk_name, cpath, MAX_PATH_LENGTH*2);
+    _win_utf8_to_wide(disk_file_name, cpath, MAX_PATH_LENGTH*2);
     File_Handle f = CreateFileW(
         cpath, GENERIC_READ,
         FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -259,8 +270,36 @@ s64 worker_proc(Thread *t) {
 		volatile u64 work_index = sys_atomic_add_64(&worked_count, 1);
 		
 		volatile Disk_Entry *entry = work + work_index;
+		if (entry->garbage) continue;
+		
+		if (entry->pointer_to_parent_entry) {
+			Disk_Entry *parent = *entry->pointer_to_parent_entry;
+			assert(parent);
+		}
 		
 		bool name_printed = false;
+		
+		if (strings_match(search_term, STR("*"))) {
+			sys_atomic_add_64(&match_count, 1);
+			string dirpath = STR("");
+			
+			if (entry->pointer_to_parent_entry) {
+				Disk_Entry *parent = *entry->pointer_to_parent_entry;
+				while (parent && !strings_match(parent->name, STR("."))) {
+					dirpath = tprint("%s\\%s", parent->name, dirpath);
+					
+					if (parent->pointer_to_parent_entry) {
+						parent = *parent->pointer_to_parent_entry;
+					} else break;
+				}
+			}
+			
+			dirpath = tprint("%s:\\%s", disk_id, dirpath);
+			
+			print("%s%s\n", dirpath, entry->name);
+			
+			continue;
+		}
 		
 		if (entry->resident) {
 			string content = (string) { entry->size, entry->data };
@@ -274,7 +313,22 @@ s64 worker_proc(Thread *t) {
 					
 					sys_atomic_add_64(&match_count, 1);
 					
-					print("%s:, Small:\n\"%s\"\n\n", entry->name, view_string);
+					string dirpath = STR("");
+					
+					if (entry->pointer_to_parent_entry) {
+						Disk_Entry *parent = *entry->pointer_to_parent_entry;
+						while (parent && !strings_match(parent->name, STR("."))) {
+							dirpath = tprint("%s\\%s", parent->name, dirpath);
+							
+							if (parent->pointer_to_parent_entry) {
+								parent = *parent->pointer_to_parent_entry;
+							} else break;
+						}
+					}
+					
+					dirpath = tprint("%s:\\%s", disk_id, dirpath);
+					
+					print("%s%s:\n\"%s\"\n\n", dirpath, entry->name, view_string);
 					
 					sys_atomic_add_64(&match_count, 1);
 					
@@ -358,7 +412,21 @@ s64 worker_proc(Thread *t) {
 							
 							sys_atomic_add_64(&match_count, 1);
 							
-							print("%s:, Large:\n\"%s\"\n\n", entry->name, view_string);
+							string dirpath = STR("");
+					
+							if (entry->pointer_to_parent_entry) {
+								Disk_Entry *parent = *entry->pointer_to_parent_entry;
+								while (parent && !strings_match(parent->name, STR("."))) {
+									dirpath = tprint("%s\\%s", parent->name, dirpath);
+									
+									if (parent->pointer_to_parent_entry) {
+										parent = *parent->pointer_to_parent_entry;
+									} else break;
+								}
+							}
+							dirpath = tprint("%s:\\%s", disk_id, dirpath);
+					
+							print("%s%s::\n\"%s\"\n\n", dirpath, entry->name, view_string);
 							
 							(void)name_printed;
 							
@@ -380,15 +448,15 @@ s64 worker_proc(Thread *t) {
 }
 
 int main(int argc, char **argv) {
-
-	f64 t0, t1, time;
+	
+	f64 t0, t1;
 
 	sys_semaphore_init(&work_semaphore);
 	work_arena = make_arena(GiB(16), MiB(30));
 	work = (Disk_Entry*)work_arena.start;
 
 	search_directory = STR("");
-	search_term = STR("");
+	search_term = STR("*");
 	full_filter = STR("");
 	
 	for (int i = 1; i < argc; i += 1) {
@@ -436,10 +504,6 @@ int main(int argc, char **argv) {
 		print("Missing search directory (-d, --directory)\n");
 		sys_exit(1);
 	}
-	if (!has_search_term) {
-		print("Missing search term (-t, --term)\n");
-		sys_exit(1);
-	}
 	
 	s64 index;
 	while ((index = string_find_index_from_left(full_filter, STR(","))) != -1) {
@@ -462,20 +526,35 @@ int main(int argc, char **argv) {
 		sys_exit(1);
 	}
 	
-	string disk_id = string_slice(search_directory, 0, (u64)colon_index);
 	
-	disk_name = tprint("\\\\.\\%s:", disk_id);
+	while (string_ends_with(search_directory, STR("\\"))) {
+		search_directory.count -= 1;
+	}
+	
+	if (string_count_occurences(search_directory, STR("\\")) == 0) {
+		is_entire_volume_search = true;
+	}
+	
+	disk_id = string_slice(search_directory, 0, (u64)colon_index);
+	
+	disk_file_name = tprint("\\\\.\\%s:", disk_id);
 	
     u16 _cpath[MAX_PATH_LENGTH*2];
     u16 *cpath = _cpath;
-    _win_utf8_to_wide(disk_name, cpath, MAX_PATH_LENGTH*2);
+    _win_utf8_to_wide(disk_file_name, cpath, MAX_PATH_LENGTH*2);
     File_Handle f = CreateFileW(
         cpath, GENERIC_READ,
         FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
         0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, 0
     );
     
-    if (f == (File_Handle)0xffffffffffffffff) return false;
+    /*File_Handle f = CreateFileW(
+        L"dump_boot.bin", GENERIC_READ,
+        FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+        0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, 0
+    );*/
+    
+    if (f == (File_Handle)0xffffffffffffffff) return 1;
     
     BYTE sector[512];
     DWORD read;
@@ -508,6 +587,12 @@ int main(int argc, char **argv) {
     
     SetFilePointerEx(f, mv, &new_pointer, 0/*FILE_BEGIN*/);
     
+    /*f = CreateFileW(
+        L"dump_records.bin", GENERIC_READ,
+        FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+        0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, 0
+    );*/
+    
     t0 = sys_get_seconds_monotonic();
     
     u8* file_record_buffer = PushTempBuffer(u8, record_size+boot->bytes_per_sector);
@@ -525,7 +610,7 @@ int main(int argc, char **argv) {
     ///////////
 	/// Run through metafiles and find MFT data run descriptors
     	
-    while (strings_match((string){4, rec->magic}, STR("FILE"))) {
+    while (strings_match((string){4, rec->magic}, STR("FILE")) && !found_mft) {
     	Attribute_Header_Base *attr_header_base = (Attribute_Header_Base *)((u8*)rec + rec->first_attribute_offset);
     	
     	bool is_mft = false;
@@ -545,6 +630,13 @@ int main(int argc, char **argv) {
 	    		string name = string_allocate(get_temp(), attr->file_name_length*3+1);
 	    		
 	    		name.count = (u64)WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)attr->name, (int)attr->file_name_length, (char*)name.data, (int)name.count, 0, 0);
+	    		print("Name: %s\n", name);
+	    		
+	    		if (strings_match(name, STR("."))) {
+	    			//__debugbreak();
+	    		}
+	    		
+	    		
 	    		if (strings_match(name, STR("$MFT"))) {
 	    			found_mft = true;
 	    			is_mft = true;
@@ -603,6 +695,10 @@ int main(int argc, char **argv) {
 	    		}
 	    	}
 	    	
+	    	if (attr_header_base->type == ATTR_LOGGED_UTILITY_STREAM) {
+	    		break;
+	    	}
+	    	
 	    	attr_header_base = (Attribute_Header_Base*)((u8*)attr_header_base + attr_header_base->length_including_header);
     	}
     	
@@ -612,12 +708,14 @@ int main(int argc, char **argv) {
     
     
     if (!found_mft) {
-    	return false;
+    	print("Didn't find $MFT ??\n");
+    	return 1;
     }
     
+    //sys_exit(0);
+    
     t1 = sys_get_seconds_monotonic();
-    time = t1 - t0;
-    print("Finding $MFT data runs: %f seconds\n", time);
+    f64 data_runs_time = t1 - t0;
     
     t0 = sys_get_seconds_monotonic();
     
@@ -626,44 +724,57 @@ int main(int argc, char **argv) {
     u64 total_file_count = 0;
     u64 total_bytes_read = 0;
     
-    void *mapped_pointers[4096];
-    u64 mapped_pointer_count = 0;
-    
     
     u64 total_record_count = 0;
     for (u64 i = 0; i < record_range_count; i += 1) {
     	total_record_count += record_ranges[i].record_count;
     }
     
-	u64 ps = sys_get_info().page_size;
-	u64 page_count = (total_record_count*record_size + ps + 1) / ps;
-	
-    Frn_To_Index_Mapping *frn_to_index_mapping = (Frn_To_Index_Mapping *)sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
-    (void)frn_to_index_mapping;
+    u64 total_records_size = total_record_count*record_size;
+    u64 total_entries_per_record_size = total_record_count*sizeof(Disk_Entry*);
+    u64 alloc_size = total_records_size + total_entries_per_record_size;
     
-    Disk_Entry *next_entry = (Disk_Entry*)arena_push(&work_arena, sizeof(Disk_Entry));
+	u64 ps = sys_get_info().page_size;
+	u64 page_count = (alloc_size + ps + 1) / ps;
+	u8 *record_data = sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
+	if (!record_data) return 1;
+	
+	Disk_Entry **entries_per_record = (Disk_Entry **)(record_data + total_records_size);
+	memset(entries_per_record, 0, total_entries_per_record_size);
+	
+	Arena dir_arena = make_arena(GiB(16), KiB(64));
+	Disk_Entry *dirs = (Disk_Entry*)dir_arena.start;
+	u64 dir_count = 0;
+    
     File_Handle test = sys_open_file(STR("files.txt"), FILE_OPEN_WRITE | FILE_OPEN_CREATE | FILE_OPEN_RESET);
+    
+    u64 processed_record_count = 0;
+
+	Disk_Entry *search_directory_entry = 0;
+    
+    f64 read_mft_time = 0.0;
+    
+	Disk_Entry next_entry = (Disk_Entry){0};
+	next_entry.pointer_to_parent_entry = 0;
 	for (u64 i = 0; i < record_range_count; i += 1) {
 		Record_Range range = record_ranges[i];
 		
-		u64 records_byte_size = range.record_count * record_size;
-		page_count = (records_byte_size + ps + 1) / ps;
-		
-		u8 *record_data = sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
-		if (!record_data) return false;
-		
-		mapped_pointers[mapped_pointer_count++] = record_data;
 		
 		assert((page_count*ps) % record_size == 0);
 		
 		mv.QuadPart = (LONGLONG)(range.first_record_index*record_size);
 		SetFilePointerEx(f, mv, &new_pointer, 0/*FILE_BEGIN*/);
-		ReadFile(f, record_data, (DWORD)records_byte_size, &read, 0);
-		if (read != (DWORD)records_byte_size) return false;
+		
+		f64 tt0 = sys_get_seconds_monotonic();
+		ReadFile(f, record_data + processed_record_count*record_size, (DWORD)(range.record_count*record_size), &read, 0);
+		f64 tt1 = sys_get_seconds_monotonic();
+		read_mft_time += (tt1-tt0);
+		if (read != (DWORD)range.record_count*record_size) return 1;
 		
 		
 		for (u64 j = 0; j < range.record_count; j += 1) {
-			rec = (File_Record*)(record_data + record_size*j);
+    		
+			rec = (File_Record*)(record_data + (processed_record_count*record_size + record_size*j));
 			ntfs_apply_fixups(rec, record_size, boot->bytes_per_sector);
 			
 			if (!strings_match((string){4, rec->magic}, STR("FILE"))) {
@@ -672,8 +783,9 @@ int main(int argc, char **argv) {
 			}
 			
 			bool any_match = false;
-			next_entry->is_directory = (rec->flags & FILE_FLAGS_Directory) != 0;
-			next_entry->id = rec->base_file_record_reference;
+			next_entry.is_directory = (rec->flags & FILE_RECORD_FLAGS_DIRECTORY) != 0;
+			//next_entry.id = rec->base_file_record_reference;
+			
 			
 			
 			total_file_count += 1;
@@ -743,55 +855,145 @@ int main(int argc, char **argv) {
 						
 					}
 					
-					next_entry->name = name;
-					next_entry->parent_id = attr->parent_file_reference;
+					next_entry.name = name;
+					
+					if (attr->parent_file_reference != 0) {
+						u64 parent_index = attr->parent_file_reference & 0x0000ffffffffffff;
+						next_entry.pointer_to_parent_entry = entries_per_record + parent_index;
+					}
 					
 					
 				} else if (attr_header_base->type == ATTR_DATA) {
-					assert(!next_entry->is_directory);
-					next_entry->resident = resident;
+					assert(!next_entry.is_directory);
+					next_entry.resident = resident;
 					
 					//assert(!attr_named);
 					
 					if (resident) {
 						Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
-						next_entry->size = attr_header->attribute_length;
-						next_entry->data = (u8*)attr_header + attr_header->attribute_offset;
+						next_entry.size = attr_header->attribute_length;
+						next_entry.data = (u8*)attr_header + attr_header->attribute_offset;
 					} else {
 						Attribute_Header_Non_Resident *attr_header = (Attribute_Header_Non_Resident *)attr_header_base;
-						next_entry->size = ((u64)attr_header->base.length_including_header - (u64)attr_header->offset_to_data_runs);
-						next_entry->data = (u8*)attr_header + attr_header->offset_to_data_runs;
+						next_entry.size = ((u64)attr_header->base.length_including_header - (u64)attr_header->offset_to_data_runs);
+						next_entry.data = (u8*)attr_header + attr_header->offset_to_data_runs;
 					}
 					
+				} else if (attr_header_base->type == ATTR_INDEX_ROOT) {
+					//__debugbreak();
 				}
 				
+				if (attr_header_base->type == ATTR_LOGGED_UTILITY_STREAM) {
+		    		break;
+		    	}
 				attr_header_base = (Attribute_Header_Base*)((u8*)attr_header_base + attr_header_base->length_including_header);
 			}
 			
-			if (any_match && next_entry->data && !(rec->flags & FILE_FLAGS_Compressed)) {
+			
+			if (any_match && next_entry.data && !(rec->flags & FILE_FLAGS_Compressed)) {
 			
 				filename_match_count += 1;
-			
+				
+				entries_per_record[processed_record_count+j] 
+					= arena_push_copy(&work_arena, &next_entry, sizeof(Disk_Entry));
 				sys_atomic_add_64(&work_count, 1);
 				
+				assert(next_entry.data != 0);
 				sys_semaphore_signal(&work_semaphore);
-				assert(next_entry->data != 0);
-				next_entry = (Disk_Entry*)arena_push(&work_arena, sizeof(Disk_Entry));
+				
+				next_entry.pointer_to_parent_entry = 0;
+				
+			} else if (rec->flags & FILE_RECORD_FLAGS_DIRECTORY) {
+				
+				Disk_Entry *dir_entry = arena_push_copy(&dir_arena, &next_entry, sizeof(Disk_Entry));
+				entries_per_record[processed_record_count+j] = dir_entry;
+				if (is_entire_volume_search && strings_match(dir_entry->name, STR("."))) {
+					search_directory_entry = dir_entry;
+				}
+				
+				dir_count += 1;
+			}
+		}
+		
+		processed_record_count += range.record_count;
+	}
+	
+	u64 slashes = string_count_occurences(search_directory, STR("\\"));
+	
+	if (slashes > 0) {
+		u64 search_dir_name_count = 0;
+		string *search_dir_names = PushTempBuffer(string, slashes+1);
+		
+		string next = search_directory;
+		for (u64 i = 0; i < slashes; i += 1) {
+			s64 slash_index = string_find_index_from_right(next, STR("\\"));
+			search_dir_names[search_dir_name_count++] = string_slice(next, (u64)slash_index+1, next.count-(u64)slash_index-1);
+			next = string_slice(next, 0, (u64)slash_index);
+		}
+		search_dir_names[search_dir_name_count++] = STR(".");
+		
+		for (u64 i = 0; i < dir_count; i += 1) {
+			
+			u64 dir_match_count = 0;
+			Disk_Entry *dir = dirs + i;
+			Disk_Entry *next_dir = dir;
+			for (u64 j = 0; j < search_dir_name_count; j += 1) {
+				
+				if (strings_match(next_dir->name, search_dir_names[j])) {
+					dir_match_count += 1;
+				} else {
+					dir_match_count = 0;
+				}
+				
+				if (strings_match(next_dir->name, STR("."))) {
+					break;
+				}
+				
+				if (!next_dir->pointer_to_parent_entry) {
+					break;
+				}
+				next_dir = *next_dir->pointer_to_parent_entry;
+			}
+			
+			if (dir_match_count == search_dir_name_count) {
+				search_directory_entry = dir;
+				break;
 			}
 		}
 		
 	}
+	for (u64 i = 0; i < work_count; ++i) {
+	    Disk_Entry *p = *work[i].pointer_to_parent_entry;
+	    bool keep = false;
+	
+	    while (p) {
+	        if (p == search_directory_entry) {
+	            keep = true;
+	            break;
+	        }
+	        if (strings_match(p->name, STR(".")))
+	        
+	            break;
+	
+	        p = *p->pointer_to_parent_entry; 
+	    }
+	
+	    if (!keep)
+	        work[i].garbage = true;
+	}
+	
+	
 	
 	t1 = sys_get_seconds_monotonic();
-    time = t1 - t0;
-    print("Filtering & indexing NTFS records: %f seconds\n", time);
-	
-	//sys_exit(0);
+    f64 filtering_time = t1 - t0;
+    
 	
 	work_probe_done = true;
 	
 	u64 worker_count = max((sys_get_info().logical_cpu_count/4)*3, 1);
     //u64 worker_count = sys_get_info().logical_cpu_count*3;
+    
+    t0 = sys_get_seconds_monotonic();
     
     Thread *threads = PushTempBuffer(Thread, worker_count);
 	for (u64 i = 0; i < worker_count; i += 1) {
@@ -810,20 +1012,26 @@ int main(int argc, char **argv) {
     	sys_thread_join(t);
     }
     
-    for (u64 i = 0; i < mapped_pointer_count; i += 1) {
-		sys_unmap_pages(mapped_pointers[i]);
-    }
-	
+    t1 = sys_get_seconds_monotonic();
+    f64 search_time = t1 - t0;
+    
 	(void)hole_count;(void)total_file_count;(void)total_bytes_read;
+	if (!has_search_term) {
+		print("No search term was specified (-t, --term), so any matching filename was printed.\n");
+	}
 	print("Holes: %u\n", hole_count);
 	print("File Count: %u\n", total_file_count);
 	print("Matched file count: %u\n", filename_match_count);
 	print("Matches found: %u\n", match_count);
 	print("Bad: %u\n", bad_counter);
+	print("Finding MFT Data runs took %f seconds\n", data_runs_time);
+	print("Filtering and indexing drive took %f seconds\n", filtering_time);
+	print("\t/Time spent reading MFT file records: %f\n", read_mft_time);
+	print("Searching files took %f seconds\n", search_time);
 	sys_close(test);
 	
 	
-	print("Goodbye\n");
+	print("Goodbye.\n");
 	return 0;
 }
 
