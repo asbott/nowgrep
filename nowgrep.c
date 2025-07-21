@@ -44,54 +44,54 @@
 
 static void swap_bytes(char *a, char *b, size_t size)
 {
-    while (size--)
-    {
-        char tmp = *a;
-        *a++ = *b;
-        *b++ = tmp;
-    }
+	while (size--)
+	{
+		char tmp = *a;
+		*a++ = *b;
+		*b++ = tmp;
+	}
 }
 
 static void qsort_recursive(char *base,
-                            size_t n,
-                            size_t size,
-                            int (*compar)(const void *, const void *))
+	size_t n,
+	size_t size,
+	int (*compar)(const void *, const void *))
 {
-    if (n < 2)
-        return;
-
-    size_t pivot_index = n / 2;
-    char *pivot = base + pivot_index * size;
-
-    swap_bytes(pivot, base + (n - 1) * size, size);
-    pivot = base + (n - 1) * size;
-
-    size_t store = 0;
-    for (size_t i = 0; i < n - 1; ++i)
-    {
-        char *elem = base + i * size;
-        if ((*compar)(elem, pivot) < 0)
-        {
-            swap_bytes(elem, base + store * size, size);
-            ++store;
-        }
-    }
-    swap_bytes(base + store * size, pivot, size);
-
-    qsort_recursive(base,                store,              size, compar);
-    qsort_recursive(base + (store + 1) * size,
-                    n - store - 1,       size, compar);
+	if (n < 2)
+	return;
+	
+	size_t pivot_index = n / 2;
+	char *pivot = base + pivot_index * size;
+	
+	swap_bytes(pivot, base + (n - 1) * size, size);
+	pivot = base + (n - 1) * size;
+	
+	size_t store = 0;
+	for (size_t i = 0; i < n - 1; ++i)
+	{
+		char *elem = base + i * size;
+		if ((*compar)(elem, pivot) < 0)
+		{
+			swap_bytes(elem, base + store * size, size);
+			++store;
+		}
+	}
+	swap_bytes(base + store * size, pivot, size);
+	
+	qsort_recursive(base,                store,              size, compar);
+	qsort_recursive(base + (store + 1) * size,
+		n - store - 1,       size, compar);
 }
 
 void qsort(void *base,
-           size_t nitems,
-           size_t size,
-           int (*compar)(const void *, const void *))
+	size_t nitems,
+	size_t size,
+	int (*compar)(const void *, const void *))
 {
-    if (!base || !compar || size == 0 || nitems < 2)
-        return; 
-
-    qsort_recursive((char *)base, nitems, size, compar);
+	if (!base || !compar || size == 0 || nitems < 2)
+	return;
+	
+	qsort_recursive((char *)base, nitems, size, compar);
 }
 #define STBRP_SORT qsort
 
@@ -440,6 +440,12 @@ typedef struct Volume_Database {
 	
 } Volume_Database;
 
+typedef struct Query {
+	Volume_Database vol;
+	Disk_Entry **child_entries; // persistent array
+	Disk_Entry **filtered_entries; // persistent array
+} Query;
+
 typedef struct Record_Range {
 	u64 first_record_index;
 	u64 record_count;
@@ -497,18 +503,14 @@ void timestamp_end(string label) {
 
 #define BYTES_PER_RECORD_READBACK (MiB(64))
 unit_local u64 max_indexing_memory_usage = GiB(3);
-unit_local string search_directory;
-unit_local bool has_search_directory = false;
-unit_local string search_term;
-unit_local bool has_search_term = false;
-unit_local string filters[2048];
-unit_local u64 filter_count;
 unit_local bool is_entire_volume_search = false;
 unit_local bool is_command_line = false;
 
 bool index_volume(string disk_id, Volume_Database *vol) {
 	
 	*vol = (Volume_Database){0};
+	
+	vol->name = disk_id;
 	
 	string disk_file_name = tprint("\\\\.\\%s:", disk_id);
 	
@@ -904,7 +906,7 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 		}
 	}
 	if (!is_command_line)
-		for (u64 k = 0; k < max_readback_count; k += 1) CloseHandle(events[k]);
+	for (u64 k = 0; k < max_readback_count; k += 1) CloseHandle(events[k]);
 	
 	if (!is_command_line) {
 		sys_unmap_pages(records_buffer);
@@ -922,11 +924,11 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 }*/
 
 string tprint_entry_full_path(string volume_label, Disk_Entry *entry) {
-	string dirpath = STR("");	
+	string dirpath = STR("");
 	
 	if (entry->pointer_to_parent_entry) {
 		Disk_Entry *parent = *entry->pointer_to_parent_entry;
-		while (parent && !strings_match(parent->name, STR("."))) {
+		while (parent && parent != *parent->pointer_to_parent_entry && !strings_match(parent->name, STR("."))) {
 			dirpath = tprint("%s\\%s", parent->name, dirpath);
 			
 			if (parent->pointer_to_parent_entry) {
@@ -947,128 +949,197 @@ typedef struct Gui_State {
 
 Gui_State state = (Gui_State){0};
 
-int drawCallback(struct nk_context *ctx)
-{
-    static char dir[MAX_PATH]         = {0};
-    static char filter[MAX_FILTER]    = {0};
-    static char search_str[MAX_SEARCH]= {0};
-    static char *results[MAX_RESULTS];
-    static int   result_count = 0;
-    static int   selected     = -1;
+int gui_loop(void);
 
-    nk_layout_row_dynamic(ctx, 30, 1);
-    nk_label(ctx, "Directory:", NK_TEXT_LEFT);
-    nk_edit_string_zero_terminated(ctx, NK_EDIT_SIMPLE,
-                                   dir, MAX_PATH, nk_filter_default);
-
-    nk_layout_row_dynamic(ctx, 30, 1);
-    nk_label(ctx, "Filter:", NK_TEXT_LEFT);
-    nk_edit_string_zero_terminated(ctx, NK_EDIT_SIMPLE,
-                                   filter, MAX_FILTER, nk_filter_default);
-
-    nk_layout_row_dynamic(ctx, 30, 1);
-    nk_label(ctx, "Search substring:", NK_TEXT_LEFT);
-    nk_edit_string_zero_terminated(ctx, NK_EDIT_SIMPLE,
-                                   search_str, MAX_SEARCH, nk_filter_default);
-
-    nk_layout_row_dynamic(ctx, 30, 2);
-    if (nk_button_label(ctx, "Search")) {
-        selected = -1;
-    }
-    if (nk_button_label(ctx, "Clear")) {
-        result_count = 0;
-        selected     = -1;
-    }
-
-    nk_layout_row_dynamic(ctx, 0, 1);
-    if (nk_group_begin(ctx, "Results",
-                       NK_WINDOW_BORDER|NK_WINDOW_NO_SCROLLBAR)) {
-        nk_layout_row_dynamic(ctx, 20, 1);
-        for (int i = 0; i < result_count; ++i) {
-        	nk_bool sl = (selected == i);
-            nk_selectable_label(ctx, results[i],
-                                NK_TEXT_LEFT,
-                                &sl);
-            if (nk_item_is_any_active(ctx))
-                selected = i;
-        }
-        nk_group_end(ctx);
-    }
-
-    return 1;
-}
-
-int gui_loop(void) {
-
-	u64 names_size = (u64)GetLogicalDriveStringsA(0, 0);
-	u8 *names_buffer = PushTempBuffer(u8, names_size);
-
-	GetLogicalDriveStringsA((DWORD)names_size, (LPSTR)names_buffer);
-	u8 *next = names_buffer;
+Disk_Entry *full_path_to_entry_directory(Volume_Database vol, string path) {
+	timestamp_begin(STR("Find directory entry"));
 	
-	while (next < names_buffer + names_size) {
-		string str = STR(next);
+	u64 slashes = string_count_occurences(path, STR("\\"));
+	Disk_Entry *path_entry = 0;
+	
+	if (slashes > 0) {
+		u64 search_dir_name_count = 0;
+		string *search_dir_names = PushTempBuffer(string, slashes+1);
 		
-		s64 colon_index = string_find_index_from_left(str, STR(":"));
-		if (colon_index > 0) {
+		string next = path;
+		for (u64 i = 0; i < slashes; i += 1) {
+			s64 slash_index = string_find_index_from_right(next, STR("\\"));
+			search_dir_names[search_dir_name_count++] = string_slice(next, (u64)slash_index+1, next.count-(u64)slash_index-1);
+			next = string_slice(next, 0, (u64)slash_index);
+		}
+		search_dir_names[search_dir_name_count++] = STR(".");
 		
-			string volume_name = string_slice(str, 0, (u64)colon_index);
+		for (u64 i = 0; i < vol.entry_count; i += 1) {
 			
-			print("Indexing volume '%s'\n", volume_name);
-			bool ok = index_volume(volume_name, &state.vols[state.vol_count++]);
-			if (!ok) {
-				print("Failed indexing volume '%s'\n", volume_name);
-				state.vol_count -= 1;
-			} else {
-				print("Indexed volume '%s'\n", volume_name);
+			u64 dir_match_count = 0;
+			
+			Disk_Entry *entry = &vol.entries[i];
+			
+			if (!entry->is_directory) continue;
+			
+			Disk_Entry *next_dir = entry;
+			for (u64 j = 0; j < search_dir_name_count; j += 1) {
+				
+				if (strings_match(next_dir->name, search_dir_names[j])) {
+					dir_match_count += 1;
+				} else {
+					dir_match_count = 0;
+				}
+				
+				if (strings_match(next_dir->name, STR("."))) {
+					break;
+				}
+				
+				if (!next_dir->pointer_to_parent_entry) {
+					break;
+				}
+				next_dir = *next_dir->pointer_to_parent_entry;
+			}
+			
+			if (dir_match_count == search_dir_name_count) {
+				path_entry = entry;
+				break;
 			}
 		}
 		
-		next += str.count+1;
+	} else {
+		path_entry = vol.root_entry;
 	}
+	
+	timestamp_end(STR("Find directory entry"));
+	
+	return path_entry;
+}
 
-	nkgdi_window_init();
+Query query_volume(Volume_Database vol, Disk_Entry *directory, string *filters, u64 filter_count) {
+	Query query = (Query){0};
+	query.vol = vol;
 	
-	struct nkgdi_window w1;
-	memset(&w1, 0x0, sizeof(struct nkgdi_window));
+	persistent_array_init((void**)&query.child_entries, sizeof(Disk_Entry*));
+	persistent_array_init((void**)&query.filtered_entries, sizeof(Disk_Entry*));
 	
-	w1.allow_sizing = 1;
-	w1.allow_maximize = 1;
-	w1.allow_move = 1;
-	w1.has_titlebar = 1;
-	w1.cb_on_draw = &drawCallback;
-	nkgdi_window_create(&w1, 1024, 1024, "nowgrep", 520, 10);
-	
-	f64 target_ms = 1.0/240.0;
-	
-	f64 last_time = sys_get_seconds_monotonic();
-	
-	while (nkgdi_window_update(&w1)) {
-		reset_temporary_storage();
-		f64 now = sys_get_seconds_monotonic();
-		f64 delta = now - last_time;
+	timestamp_begin(STR("Find children of search directory"));
+	for (u64 i = 0; i < vol.entry_count; i += 1) {
+		Disk_Entry *entry = &vol.entries[i];
 		
-		if (delta < target_ms) {
-		  DWORD sleep_ms = (DWORD)((target_ms - delta) * 1000.0);
-		  if (sleep_ms > 0) Sleep(sleep_ms);
+		if (!entry->valid)          continue;
+		if (entry->is_directory)    continue;
+		if (entry->name.count == 0) continue;
 		
-		  while ((now = sys_get_seconds_monotonic()) - last_time < target_ms) {
-		      /* spin */
-		  }
+		if (entry->pointer_to_parent_entry) {
+			bool search_dir_is_ancestor = false;
+			
+			Disk_Entry *next = entry;
+			
+			while (*next->pointer_to_parent_entry && *next->pointer_to_parent_entry != next) {
+				if (*next->pointer_to_parent_entry == directory) {
+					search_dir_is_ancestor = true;
+					break;
+				}
+				next = *next->pointer_to_parent_entry;
+			}
+			
+			if (!search_dir_is_ancestor) continue;
+			
+			persistent_array_push_copy(query.child_entries, &entry);
+		}
+	}
+	timestamp_end(STR("Find children of search directory"));
+	
+	timestamp_begin(STR("Find children which match filter"));
+	for (u64 i = 0; i < persistent_array_count(query.child_entries); i += 1) {
+		Disk_Entry *entry = query.child_entries[i];
+		
+		bool any_match = false;
+		
+		string name = entry->name;
+		
+		for (u64 k = 0; k < filter_count; k += 1) {
+			string filter = filters[k];
+			bool prefix_wildcard = filter.data[0] == '*';
+			bool suffix_wildcard = filter.data[filter.count-1] == '*';
+			
+			if (!prefix_wildcard && !suffix_wildcard) {
+				if (strings_match(filter, name)) {
+					any_match = true;
+					break;
+				}
+			}
+			
+			if (prefix_wildcard && !suffix_wildcard) {
+				string end = filter;
+				end.data += 1;
+				end.count -= 1;
+				
+				if (string_ends_with(name, end)) {
+					any_match = true;
+					break;
+				}
+			}
+			
+			if (!prefix_wildcard && suffix_wildcard) {
+				string start = filter;
+				start.count -= 1;
+				
+				if (string_starts_with(name, start)) {
+					any_match = true;
+					break;
+				}
+			}
+			
+			if (prefix_wildcard && suffix_wildcard) {
+				string middle = filter;
+				middle.count -= 2;
+				middle.data += 1;
+				
+				if (string_find_index_from_left(name, middle) != -1) {
+					any_match = true;
+					break;
+				}
+			}
+			
 		}
 		
-		last_time = sys_get_seconds_monotonic();
+		if (any_match) {
+			persistent_array_push_copy(query.filtered_entries, &entry);
+		}
+	}
+	timestamp_end(STR("Find children which match filter"));
+	
+	return query;
+}
+
+void query_free(Query query) {
+	persistent_array_uninit(query.child_entries);
+	persistent_array_uninit(query.filtered_entries);
+}
+
+u64 parse_filters(string full_filter, string *filters, u64 max_count) {
+	u64 filter_count = 0;
+	
+	s64 index;
+	while ((index = string_find_index_from_left(full_filter, STR(","))) != -1) {
+		string filter = string_trim(string_slice(full_filter, 0, (u64)index));
+		if (filter.count > 0) filters[filter_count++] = filter;
+		full_filter = string_slice(full_filter, (u64)index+1, full_filter.count-(u64)index-1);
+		
+		if (filter_count == max_count) break;
+	}
+	if (filter_count != max_count) {
+		full_filter = string_trim(full_filter);
+		if (full_filter.count > 0) filters[filter_count++] = full_filter;
 	}
 	
-	nkgdi_window_destroy(&w1);
-	
-	nkgdi_window_shutdown();
-	return 0;
+	return filter_count;
 }
 
 int main(int argc, char **argv) {
-	search_directory = STR("");
-	search_term = STR("*");
+	string search_directory = STR("");
+	bool has_search_directory = false;
+	string search_term = STR("*"); (void)search_term;
+	bool has_search_term = false; (void)has_search_term;
+	string filters[2048] = {0};
+	u64 filter_count = 0;
 	
 	if (argc == 1) {
 		gui_loop();
@@ -1130,14 +1201,7 @@ int main(int argc, char **argv) {
 				sys_exit(1);
 			}
 			
-			s64 index;
-			while ((index = string_find_index_from_left(full_filter, STR(","))) != -1) {
-				string filter = string_trim(string_slice(full_filter, 0, (u64)index));
-				if (filter.count > 0) filters[filter_count++] = filter;
-				full_filter = string_slice(full_filter, (u64)index+1, full_filter.count-(u64)index-1);
-			}
-			full_filter = string_trim(full_filter);
-			if (full_filter.count > 0) filters[filter_count++] = full_filter;
+			filter_count = parse_filters(full_filter, filters, 2048);
 			
 			if (!sys_get_absolute_path(get_temp(), search_directory, &search_directory)) {
 				print("Invalid path '%s'\n", search_directory);
@@ -1180,161 +1244,17 @@ int main(int argc, char **argv) {
 		
 		timestamp_end(STR("Index Volume"));
 		
-		timestamp_begin(STR("Find indexed search directory entry"));
-		
-		u64 slashes = string_count_occurences(search_directory, STR("\\"));
-		Disk_Entry *search_directory_entry = 0;
-		
-		if (slashes > 0) {
-			u64 search_dir_name_count = 0;
-			string *search_dir_names = PushTempBuffer(string, slashes+1);
-			
-			string next = search_directory;
-			for (u64 i = 0; i < slashes; i += 1) {
-				s64 slash_index = string_find_index_from_right(next, STR("\\"));
-				search_dir_names[search_dir_name_count++] = string_slice(next, (u64)slash_index+1, next.count-(u64)slash_index-1);
-				next = string_slice(next, 0, (u64)slash_index);
-			}
-			search_dir_names[search_dir_name_count++] = STR(".");
-			
-			for (u64 i = 0; i < vol.entry_count; i += 1) {
-				
-				u64 dir_match_count = 0;
-				
-				Disk_Entry *entry = &vol.entries[i];
-				
-				if (!entry->is_directory) continue;
-				
-				Disk_Entry *next_dir = entry;
-				for (u64 j = 0; j < search_dir_name_count; j += 1) {
-					
-					if (strings_match(next_dir->name, search_dir_names[j])) {
-						dir_match_count += 1;
-					} else {
-						dir_match_count = 0;
-					}
-					
-					if (strings_match(next_dir->name, STR("."))) {
-						break;
-					}
-					
-					if (!next_dir->pointer_to_parent_entry) {
-						break;
-					}
-					next_dir = *next_dir->pointer_to_parent_entry;
-				}
-				
-				if (dir_match_count == search_dir_name_count) {
-					search_directory_entry = entry;
-					break;
-				}
-			}
-			
-		} else {
-			search_directory_entry = vol.root_entry;
-		}
-		
-		timestamp_end(STR("Find indexed search directory entry"));
+		Disk_Entry *search_directory_entry = full_path_to_entry_directory(vol, search_directory);
 		
 		if (!search_directory_entry) {
 			print("Could not find search directory entry\n");
 		}
 		
-		Disk_Entry **child_entries;
-		persistent_array_init((void**)&child_entries, sizeof(Disk_Entry*));
+		Query query = query_volume(vol, search_directory_entry, filters, filter_count);
 		
-		timestamp_begin(STR("Find children of search directory"));
-		for (u64 i = 0; i < vol.entry_count; i += 1) {
-			Disk_Entry *entry = &vol.entries[i];
-			
-			if (!entry->valid)          continue;
-			if (entry->is_directory)    continue;
-			if (entry->name.count == 0) continue;
-			
-			if (entry->pointer_to_parent_entry) {
-				bool search_dir_is_ancestor = false;
-				
-				Disk_Entry *next = entry;
-				
-				while (*next->pointer_to_parent_entry && *next->pointer_to_parent_entry != next) {
-					if (*next->pointer_to_parent_entry == search_directory_entry) {
-						search_dir_is_ancestor = true;
-						break;
-					}
-					next = *next->pointer_to_parent_entry;
-				}
-				
-				if (!search_dir_is_ancestor) continue;
-				
-				persistent_array_push_copy(child_entries, &entry);
-			}
-		}
-		timestamp_end(STR("Find children of search directory"));
-		
-		timestamp_begin(STR("Find children which match filter"));
-		for (u64 i = 0; i < persistent_array_count(child_entries); i += 1) {
-			Disk_Entry *entry = child_entries[i];
-			
-			bool any_match = false;
-			
-			string name = entry->name;
-			
-			for (u64 k = 0; k < filter_count; k += 1) {
-				string filter = filters[k];
-				bool prefix_wildcard = filter.data[0] == '*';
-				bool suffix_wildcard = filter.data[filter.count-1] == '*';
-				
-				if (!prefix_wildcard && !suffix_wildcard) {
-					if (strings_match(filter, name)) {
-						any_match = true;
-						break;
-					}
-				}
-				
-				if (prefix_wildcard && !suffix_wildcard) {
-					string end = filter;
-					end.data += 1;
-					end.count -= 1;
-					
-					if (string_ends_with(name, end)) {
-						any_match = true;
-						break;
-					}
-				}
-				
-				if (!prefix_wildcard && suffix_wildcard) {
-					string start = filter;
-					start.count -= 1;
-					
-					if (string_starts_with(name, start)) {
-						any_match = true;
-						break;
-					}
-				}
-				
-				if (prefix_wildcard && suffix_wildcard) {
-					string middle = filter;
-					middle.count -= 2;
-					middle.data += 1;
-					
-					if (string_find_index_from_left(name, middle) != -1) {
-						any_match = true;
-						break;
-					}
-				}
-				
-			}
-			
-			if (any_match) {
-				string path = tprint_entry_full_path(disk_id, entry);
-				print("%s\n", path);
-			}
-		}
-		timestamp_end(STR("Find children which match filter"));
-		
-		
-		if (!is_command_line) {
-			persistent_array_uninit(child_entries);
+		for (u64 i = 0; i < persistent_array_count(query.filtered_entries); i += 1) {
+			string path = tprint_entry_full_path(disk_id, query.filtered_entries[i]);
+			print("%s\n", path);
 		}
 		
 		print("file_record_hole_count: %u\n", vol.file_record_hole_count);
@@ -1357,5 +1277,171 @@ int main(int argc, char **argv) {
 	
 	dump_profiler_result();
 	
+	return 0;
+}
+
+
+
+
+int gui_callback(struct nk_context *ctx)
+{
+	static char dir[MAX_PATH]         = {0};
+	static char filter[MAX_FILTER]    = {0};
+	static char search_str[MAX_SEARCH]= {0};
+	static Query queries[1024];
+	static u64 query_count = 0;
+	static s64   selected     = -1;
+	static struct nk_scroll scroll = {0};
+	
+	nk_layout_row_dynamic(ctx, 30, 1);
+	nk_label(ctx, "Directory:", NK_TEXT_LEFT);
+	nk_edit_string_zero_terminated(ctx, NK_EDIT_SIMPLE,
+		dir, MAX_PATH, nk_filter_default);
+	
+	nk_layout_row_dynamic(ctx, 30, 1);
+	nk_label(ctx, "Filter:", NK_TEXT_LEFT);
+	nk_edit_string_zero_terminated(ctx, NK_EDIT_SIMPLE,
+		filter, MAX_FILTER, nk_filter_default);
+	
+	nk_layout_row_dynamic(ctx, 30, 1);
+	nk_label(ctx, "Search substring:", NK_TEXT_LEFT);
+	nk_edit_string_zero_terminated(ctx, NK_EDIT_SIMPLE,
+		search_str, MAX_SEARCH, nk_filter_default);
+	
+	nk_layout_row_dynamic(ctx, 30, 2);
+	if (nk_button_label(ctx, "Search")) {
+		
+		query_count = 0;
+		
+		string dirs = STR(dir);
+		sys_get_absolute_path(get_temp(), dirs, &dirs);
+		
+		s64 dir_colon_index = string_find_index_from_left(dirs, STR(":"));
+		
+		bool one_volume = dir_colon_index != -1;
+		
+		for (u64 i = 0; i < state.vol_count; i += 1) {
+			Volume_Database vol = state.vols[i];
+			
+			if (one_volume) {
+				
+				if (strings_match(string_slice(dirs, 0, (u64)dir_colon_index), vol.name)) {
+				
+					Disk_Entry *search_directory_entry = full_path_to_entry_directory(vol, dirs);
+					if (!search_directory_entry) {
+						print("Could not find search directory entry\n");
+						continue;
+					}
+					
+					string filters[2048];
+					u64 filter_count = parse_filters(STR(filter), filters, 2048);
+					queries[query_count++] = query_volume(vol, search_directory_entry, filters, filter_count);
+					break;
+				}
+				
+			}
+		}
+		
+		
+		selected = -1;
+	}
+	if (nk_button_label(ctx, "Clear")) {
+		query_count = 0;
+		selected     = -1;
+	}
+	
+	nk_layout_row_dynamic(ctx, 300, 1);
+	if (nk_group_scrolled_begin(ctx,
+		&scroll,
+		"Results",
+		NK_WINDOW_BORDER))
+	{
+		nk_layout_row_dynamic(ctx, 20, 2);
+		
+		u64 index = 0;
+		for (u64 i = 0; i < query_count; ++i) {
+			for (u64 j = 0; j < persistent_array_count(queries[i].filtered_entries); ++j) {
+				string name = tprint_entry_full_path(queries[i].vol.name, queries[i].filtered_entries[j]);
+				nk_bool is_sel = (selected == (s64)index);
+				if (nk_selectable_text(ctx, (char*)name.data, (int)name.count, NK_TEXT_LEFT, &is_sel)) {
+					selected = (s64)index;
+				}
+				nk_text(ctx, "<content>", (int)c_style_strlen("<content>"), NK_TEXT_LEFT);
+				index++;
+			}
+		}
+		nk_group_scrolled_end(ctx);
+	}
+	
+	return 1;
+}
+
+int gui_loop(void) {
+	
+	Arena arena = make_arena(GiB(8), KiB(32));
+	
+	u64 names_size = (u64)GetLogicalDriveStringsA(0, 0);
+	u8 *names_buffer = (u8*)arena_push(&arena, names_size);
+	
+	GetLogicalDriveStringsA((DWORD)names_size, (LPSTR)names_buffer);
+	u8 *next = names_buffer;
+	
+	while (next < names_buffer + names_size) {
+		string str = STR(next);
+		
+		s64 colon_index = string_find_index_from_left(str, STR(":"));
+		if (colon_index > 0) {
+			
+			string volume_name = string_slice(str, 0, (u64)colon_index);
+			
+			print("Indexing volume '%s'\n", volume_name);
+			bool ok = index_volume(volume_name, &state.vols[state.vol_count++]);
+			if (!ok) {
+				print("Failed indexing volume '%s'\n", volume_name);
+				state.vol_count -= 1;
+			} else {
+				print("Indexed volume '%s'\n", volume_name);
+			}
+		}
+		
+		next += str.count+1;
+	}
+	
+	nkgdi_window_init();
+	
+	struct nkgdi_window w1;
+	memset(&w1, 0x0, sizeof(struct nkgdi_window));
+	
+	w1.allow_sizing = 1;
+	w1.allow_maximize = 1;
+	w1.allow_move = 1;
+	w1.has_titlebar = 1;
+	w1.cb_on_draw = &gui_callback;
+	nkgdi_window_create(&w1, 1024, 1024, "nowgrep", 520, 10);
+	
+	f64 target_ms = 1.0/240.0;
+	
+	f64 last_time = sys_get_seconds_monotonic();
+	
+	while (nkgdi_window_update(&w1)) {
+		reset_temporary_storage();
+		f64 now = sys_get_seconds_monotonic();
+		f64 delta = now - last_time;
+		
+		if (delta < target_ms) {
+			DWORD sleep_ms = (DWORD)((target_ms - delta) * 1000.0);
+			if (sleep_ms > 0) Sleep(sleep_ms);
+			
+			while ((now = sys_get_seconds_monotonic()) - last_time < target_ms) {
+				/* spin */
+			}
+		}
+		
+		last_time = sys_get_seconds_monotonic();
+	}
+	
+	nkgdi_window_destroy(&w1);
+	
+	nkgdi_window_shutdown();
 	return 0;
 }
