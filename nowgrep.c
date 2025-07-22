@@ -1133,6 +1133,22 @@ u64 parse_filters(string full_filter, string *filters, u64 max_count) {
 	return filter_count;
 }
 
+void print_stats(Volume_Database vol) {
+	print("file_record_hole_count: %u\n", vol.file_record_hole_count);
+	print("corrupt_usn_count: %u\n", vol.corrupt_usn_count);
+	print("compressed_count: %u\n", vol.compressed_count);
+	print("attr_list_count: %u\n", vol.attr_list_count);
+	print("unnamed_count: %u\n", vol.unnamed_count);
+	print("dataless_count: %u\n", vol.dataless_count);
+	print("Total file records processed: %u\n", vol.entry_count);
+	for (u64 i = 0; i < timestamp_count; i += 1) {
+		Timestamp *ts = &timestamps[i];
+		f64 ms = ts->accum * 1000.0;
+		
+		print("\t%s: %f ms\n", ts->label, ms);
+	}
+}
+
 int main(int argc, char **argv) {
 	string search_directory = STR("");
 	bool has_search_directory = false;
@@ -1257,19 +1273,7 @@ int main(int argc, char **argv) {
 			print("%s\n", path);
 		}
 		
-		print("file_record_hole_count: %u\n", vol.file_record_hole_count);
-		print("corrupt_usn_count: %u\n", vol.corrupt_usn_count);
-		print("compressed_count: %u\n", vol.compressed_count);
-		print("attr_list_count: %u\n", vol.attr_list_count);
-		print("unnamed_count: %u\n", vol.unnamed_count);
-		print("dataless_count: %u\n", vol.dataless_count);
-		print("Total file records processed: %u\n", vol.entry_count);
-		for (u64 i = 0; i < timestamp_count; i += 1) {
-			Timestamp *ts = &timestamps[i];
-			f64 ms = ts->accum * 1000.0;
-			
-			print("\t%s: %f ms\n", ts->label, ms);
-		}
+		print_stats(vol);
 		
 		
 		print("Goodbye, Terminal.\n");
@@ -1336,6 +1340,10 @@ int gui_callback(struct nk_context *ctx)
 					string filters[2048];
 					u64 filter_count = parse_filters(STR(filter), filters, 2048);
 					queries[query_count++] = query_volume(vol, search_directory_entry, filters, filter_count);
+					
+					print_stats(vol);
+					timestamp_count = 0;
+					
 					break;
 				}
 				
@@ -1350,7 +1358,12 @@ int gui_callback(struct nk_context *ctx)
 		selected     = -1;
 	}
 	
-	nk_layout_row_dynamic(ctx, 300, 1);
+	struct nk_rect region = nk_window_get_content_region(ctx);
+	struct nk_rect last = nk_widget_bounds(ctx);
+	float used = (last.y + last.h) - region.y;
+	float remaining = region.h - used;
+	
+	nk_layout_row_dynamic(ctx, remaining, 1);
 	if (nk_group_scrolled_begin(ctx,
 		&scroll,
 		"Results",
