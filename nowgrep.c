@@ -414,15 +414,18 @@ typedef struct File_Record {
 typedef struct Disk_Entry {
 	struct Disk_Entry **pointer_to_parent_entry;
 	string name;
-	u8 *data; // Valid when resident.
+	u64 file_position; // If resident, position for file data, otherwise position for data run entries
 	u64 size; // Size of file data if resident, otherwise size of data run table.
 	bool resident; // If resident, offset is to raw data, if non resident, offset is to data runs
 	bool is_directory;
 	bool valid;
+	bool ready;
 } Disk_Entry;
 
 typedef struct Volume_Database {
 	string name; // C, D, E etc
+	
+	bool done; // Is this done or still indexing ?
 	
 	Disk_Entry *entries;
 	u64 entry_count;
@@ -438,12 +441,37 @@ typedef struct Volume_Database {
 	u64 unnamed_count;
 	u64 dataless_count;
 	
+	f64 waiting_for_io_time;
+	u64 bytes_read;
+	
 } Volume_Database;
+
+typedef struct Work {
+	u8* data;
+	u64 size;
+} Work;
+
+typedef struct Query_Context {
+	u8 *read_buffer; // Circular
+	u64 next_buffer_index;
+	u64 buffered;
+	
+	Work *work; // Persistent array
+	u64 next_work_index;
+	
+	struct Query *query;
+	Semaphore found_entry_sem;
+	u64 read_entry_count;
+	
+	string volume_name;
+	
+} Query_Context;
 
 typedef struct Query {
 	Volume_Database vol;
 	Disk_Entry **child_entries; // persistent array
 	Disk_Entry **filtered_entries; // persistent array
+	Query_Context ctx;
 } Query;
 
 typedef struct Record_Range {
@@ -501,8 +529,8 @@ void timestamp_end(string label) {
 	}
 }
 
-#define BYTES_PER_RECORD_READBACK (MiB(64))
-unit_local u64 max_indexing_memory_usage = GiB(3);
+#define BYTES_PER_READBACK (MiB(32))
+unit_local u64 max_streaming_memory = GiB(3);
 unit_local bool is_entire_volume_search = false;
 unit_local bool is_command_line = false;
 
@@ -520,12 +548,12 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 	File_Handle f = CreateFileW(
 		cpath, GENERIC_READ,
 		FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-		0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, 0
+		0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, 0
 	);
 	File_Handle fasync = CreateFileW(
 		cpath, GENERIC_READ,
 		FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-		0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED, 0
+		0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, 0
 	);
 	
 	if (f == (File_Handle)0xffffffffffffffff) {
@@ -657,8 +685,8 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 	//////////////////////
 	//// Allocate a) records readback buffer (transient), and b) the memory to hold our indexed entries etc.
 	
-	u64 max_readback_memory = max(max_indexing_memory_usage, BYTES_PER_RECORD_READBACK);
-	u64 max_readback_count = max_readback_memory/BYTES_PER_RECORD_READBACK;
+	u64 max_readback_memory = max(max_streaming_memory, BYTES_PER_READBACK);
+	u64 max_readback_count = max_readback_memory/BYTES_PER_READBACK;
 	
 	u64 ps = sys_get_info().page_size;
 	
@@ -678,8 +706,11 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 		
 		vol->entries = (Disk_Entry*)entries_mem;
 		vol->entries_per_record = (Disk_Entry**)(uintptr)align_next((u64)(entries_mem + sizeof(Disk_Entry)*vol->entry_count), 8);
+		memset(vol->entries, 0, entries_mem_size);
 	}
 	
+	////////////
+	/// Walk file records. Read future file records from disk asynchronously.
 	
 	OVERLAPPED *ovl_buffer = PushTempBuffer(OVERLAPPED, max_readback_count);
 	HANDLE *events = PushTempBuffer(HANDLE, max_readback_count);
@@ -700,8 +731,6 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 	for (u64 i = 0; i < record_range_count; i += 1) tm_scope("Record Range") {
 		Record_Range range = record_ranges[i];
 		
-		//assert((page_count*ps) % record_size == 0);
-		
 		mv.QuadPart = (LONGLONG)(range.first_record_index*record_size);
 		SetFilePointerEx(f, mv, &new_pointer, 0/*FILE_BEGIN*/);
 		
@@ -711,6 +740,10 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 		while (records_bytes_read < range.record_count*record_size) tm_scope("Record Range step") {
 			
 			u8 *readback_data = 0; (void)readback_data;
+			
+			/////
+			// Queue a maximum of 'max_queues_per_iter' future reads
+			// (Doing them all up front is slower for some reason ?)
 			
 			u64 max_queues_per_iter = 3;
 			u64 queued_this_iter = 0;
@@ -722,10 +755,10 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 				}
 				
 				u64 remainder = (range.record_count*record_size) - records_bytes_queued;
-				u64 to_read_async = (DWORD)min(remainder, BYTES_PER_RECORD_READBACK);
+				u64 to_read_async = (DWORD)min(remainder, BYTES_PER_READBACK);
 				
 				if (to_read_async) tm_scope("Queue next ReadFile") {
-					u8 *target_data = records_buffer + (readback_place_position%max_readback_count)*BYTES_PER_RECORD_READBACK;
+					u8 *target_data = records_buffer + (readback_place_position%max_readback_count)*BYTES_PER_READBACK;
 					
 					OVERLAPPED *ovl = ovl_buffer + (readback_place_position % max_readback_count);
 					*ovl = (OVERLAPPED){0};
@@ -736,6 +769,7 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 					ResetEvent(events[(readback_place_position % max_readback_count)]);
 					tm_scope("Async ReadFile call")
 					ReadFile(fasync, target_data, (DWORD)to_read_async, 0, ovl);
+					vol->bytes_read += to_read_async;
 					
 					read_sizes[(readback_place_position % max_readback_count)] = to_read_async;
 					
@@ -749,29 +783,39 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 				} else continue;
 			}
 			
-			/////
-			// Queue next reads
-			
 			if (records_bytes_read >= range.record_count*record_size) break;
+			
+			
+			/////
+			// Wait for next async read to finish
+			
+			u64 record_offset = 0;
 			
 			tm_scope("Wait Last ReadFile") {
 				OVERLAPPED *ovl = ovl_buffer + (readback_next_position % max_readback_count);
 				
 				DWORD async_read = 0;
+				f64 io0 = sys_get_seconds_monotonic();
 				BOOL ok = GetOverlappedResult(fasync, ovl, &async_read, true);
+				f64 io1 = sys_get_seconds_monotonic();
+				vol->waiting_for_io_time += io1-io0;
 				assert(ok);
 				assert(read_sizes[(readback_next_position % max_readback_count)] == async_read);
 				
-				readback_data = records_buffer + (readback_next_position%max_readback_count)*BYTES_PER_RECORD_READBACK;
+				readback_data = records_buffer + (readback_next_position%max_readback_count)*BYTES_PER_READBACK;
 				
 				readback_next_position += 1;
 				sys_atomic_add_64(&readback_count, (u64)-1);
 				
+				record_offset = (u64)ovl->Offset | ((u64)ovl->OffsetHigh << 32);
 				
 				records_bytes_read += async_read;
 				
 				read = async_read;
 			}
+			
+			/////
+			// Process the records that were fetched
 			
 			u64 to_process = read/record_size;
 			
@@ -779,9 +823,7 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 			for (u64 j = 0; j < to_process; j += 1) {
 				
 				Disk_Entry *next_entry = vol->entries + (processed_record_count + j);
-				
-				// @speed we could get rid of this?
-				memset(next_entry, 0, sizeof(Disk_Entry));
+				next_entry->valid = true;
 				
 				rec = (File_Record*)(readback_data + record_size*(j));
 				{
@@ -819,6 +861,9 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 				bool has_name = false;
 				Attribute_Header_Base *attr_header_base = (Attribute_Header_Base *)((u8*)rec + rec->first_attribute_offset);
 				
+				/////
+				// Walk attributes
+				
 				while ((u64)attr_header_base < (u64)rec + rec->file_record_real_size && *(u32*)attr_header_base != 0xFFFFFFFF) {
 					
 					bool attr_named = attr_header_base->name_length > 0;
@@ -845,6 +890,8 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 						if (attr->parent_file_reference != 0) {
 							u64 parent_index = attr->parent_file_reference & 0x0000ffffffffffff;
 							next_entry->pointer_to_parent_entry = vol->entries_per_record + parent_index;
+						} else {
+							next_entry->valid = false;
 						}
 						
 						if (strings_match(name, STR("."))) {
@@ -852,26 +899,27 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 						}
 						
 						
-					} else if (attr_header_base->type == ATTR_DATA) {
-						assert(!next_entry->is_directory);
+					} else if (attr_header_base->type == ATTR_DATA && !next_entry->is_directory) {
 						next_entry->resident = resident;
 						
 						if (resident) {
 							Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
 							next_entry->size = attr_header->attribute_length;
-							next_entry->data = (u8*)attr_header + attr_header->attribute_offset;
+							next_entry->file_position = record_offset + (u64)attr_header-(u64)rec + attr_header->attribute_offset;
 						} else {
 							Attribute_Header_Non_Resident *attr_header = (Attribute_Header_Non_Resident *)attr_header_base;
 							next_entry->size = ((u64)attr_header->base.length_including_header - (u64)attr_header->offset_to_data_runs);
-							next_entry->data = (u8*)attr_header + attr_header->offset_to_data_runs;
+							next_entry->file_position = record_offset + (u64)attr_header-(u64)rec + attr_header->offset_to_data_runs;
 						}
 						
 					}
 					
+					// This attribute is not like other attributes so it will break stuff
 					if (attr_header_base->type == ATTR_LOGGED_UTILITY_STREAM) {
 						break;
 					}
 					
+					// @todo Walk attributes in attribute list 
 					if (attr_header_base->type == ATTR_ATTRIBUTE_LIST) {
 						has_attr_list = true;
 					}
@@ -879,16 +927,16 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 					attr_header_base = (Attribute_Header_Base*)((u8*)attr_header_base + attr_header_base->length_including_header);
 				}
 				
-				
-				next_entry->valid = true;
 				if (!(rec->flags & FILE_FLAGS_Compressed)) {
 					vol->entries_per_record[processed_record_count+j] = next_entry;
 					
 					if (!next_entry->is_directory && !string_starts_with(next_entry->name, STR("$")) && !has_attr_list && has_name) {
-						if (next_entry->data == 0) {
+						if (next_entry->file_position == 0) {
 							vol->dataless_count += 1;
 						}
 					}
+					
+					next_entry->ready = true;
 				}
 				
 				if (rec->flags & FILE_FLAGS_Compressed) {
@@ -899,21 +947,22 @@ bool index_volume(string disk_id, Volume_Database *vol) {
 				}
 				if (!has_name) {
 					vol->unnamed_count += 1;
+					next_entry->valid = false;
 				}
 			}
 			
 			processed_record_count += to_process;
 		}
 	}
-	if (!is_command_line)
-	for (u64 k = 0; k < max_readback_count; k += 1) CloseHandle(events[k]);
 	
 	if (!is_command_line) {
+		for (u64 k = 0; k < max_readback_count; k += 1) CloseHandle(events[k]);
 		sys_unmap_pages(records_buffer);
 		CloseHandle(f);
 		CloseHandle(fasync);
 	}
 	
+	vol->done = true;
 	return true;
 }
 
@@ -942,8 +991,42 @@ string tprint_entry_full_path(string volume_label, Disk_Entry *entry) {
 	return tprint("%s%s", dirpath, entry->name);
 }
 
+typedef enum Task_Kind {
+	TASK_INDEX_VOLUME,
+	TASK_QUERY_VOLUME,
+} Task_Kind;
+
+typedef struct Task_Pipe {
+	f64 duration_seconds;
+	bool done;
+	bool success;
+	bool partial;
+} Task_Pipe;
+
+typedef struct Task {
+	Task_Kind kind;
+	
+	// Indexing
+	string volume_name;
+	Volume_Database *vol; // Also for querying
+	
+	// Querying
+	string search_directory;
+	string *filters;
+	u64 filter_count;
+	Query *query;
+	
+	Task_Pipe *result;
+} Task;
+
+typedef struct Volume_State {
+	Volume_Database vol;
+	Task_Pipe indexing_pipe;
+	Task_Pipe query_pipe;
+} Volume_State;
+
 typedef struct Gui_State {
-	Volume_Database vols[1024];
+	Volume_State *vol_states;
 	u64 vol_count;
 } Gui_State;
 
@@ -1011,9 +1094,69 @@ Disk_Entry *full_path_to_entry_directory(Volume_Database vol, string path) {
 	return path_entry;
 }
 
+s64 stream_thread_proc(Thread *t) {
+	Query_Context *ctx = (Query_Context*)t->userdata;
+	
+	u16 _cpath[MAX_PATH_LENGTH*2];
+	u16 *cpath = _cpath;
+	_win_utf8_to_wide(ctx->volume_name, cpath, MAX_PATH_LENGTH*2);
+	File_Handle f = CreateFileW(
+		cpath, GENERIC_READ,
+		FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+		0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, 0
+	);
+	
+	if (f == (File_Handle)0xffffffffffffffff) {
+		print("stream_thread_proc: Could not open volume for reading.\n");
+		return 1;
+	}
+	
+	while (1) {
+		reset_temporary_storage();
+		
+		sys_semaphore_wait(ctx->found_entry_sem);
+		
+		if (ctx->read_entry_count >= persistent_array_count(ctx->query->filtered_entries)) {
+			break;
+		}
+		
+		Disk_Entry *entry = ctx->query->filtered_entries[ctx->read_entry_count++];
+		
+		if (entry->resident) {
+			LARGE_INTEGER mv;
+			mv.QuadPart = (LONGLONG)entry->file_position;
+			LARGE_INTEGER new_pointer;
+			SetFilePointerEx(f, mv, &new_pointer, 0/*FILE_BEGIN*/);
+			
+			u8 *data = PushTempBuffer(u8, entry->size);
+			
+			string content = (string) {entry->size, data};
+			
+			print("%s:\n=====================\n%s\n=====================\n\n", entry->name, content);
+		}
+	}
+	
+	return 0;
+}
+
 Query query_volume(Volume_Database vol, Disk_Entry *directory, string *filters, u64 filter_count) {
 	Query query = (Query){0};
 	query.vol = vol;
+	
+	query.ctx = (Query_Context){0};
+	{
+		u64 ps = sys_get_info().page_size;
+		u64 page_count = (max_streaming_memory+ps)/ps;
+		query.ctx.read_buffer = sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
+		
+		persistent_array_init((void**)&query.ctx.work, sizeof(Work));
+		
+		query.ctx.query = &query;
+		
+		sys_semaphore_init(&query.ctx.found_entry_sem);
+		
+		query.ctx.volume_name = vol.name;
+	}
 	
 	persistent_array_init((void**)&query.child_entries, sizeof(Disk_Entry*));
 	persistent_array_init((void**)&query.filtered_entries, sizeof(Disk_Entry*));
@@ -1023,6 +1166,7 @@ Query query_volume(Volume_Database vol, Disk_Entry *directory, string *filters, 
 		Disk_Entry *entry = &vol.entries[i];
 		
 		if (!entry->valid)          continue;
+		if (!entry->ready)          continue;
 		if (entry->is_directory)    continue;
 		if (entry->name.count == 0) continue;
 		
@@ -1031,7 +1175,7 @@ Query query_volume(Volume_Database vol, Disk_Entry *directory, string *filters, 
 			
 			Disk_Entry *next = entry;
 			
-			while (*next->pointer_to_parent_entry && *next->pointer_to_parent_entry != next) {
+			while (next->valid && *next->pointer_to_parent_entry && *next->pointer_to_parent_entry != next) {
 				if (*next->pointer_to_parent_entry == directory) {
 					search_dir_is_ancestor = true;
 					break;
@@ -1102,6 +1246,7 @@ Query query_volume(Volume_Database vol, Disk_Entry *directory, string *filters, 
 		
 		if (any_match) {
 			persistent_array_push_copy(query.filtered_entries, &entry);
+			sys_semaphore_signal(&query.ctx.found_entry_sem);
 		}
 	}
 	timestamp_end(STR("Find children which match filter"));
@@ -1110,6 +1255,9 @@ Query query_volume(Volume_Database vol, Disk_Entry *directory, string *filters, 
 }
 
 void query_free(Query query) {
+	sys_unmap_pages(query.ctx.read_buffer);
+	persistent_array_uninit(query.ctx.work);
+	sys_semaphore_release(query.ctx.found_entry_sem);
 	persistent_array_uninit(query.child_entries);
 	persistent_array_uninit(query.filtered_entries);
 }
@@ -1140,10 +1288,14 @@ void print_stats(Volume_Database vol) {
 	print("attr_list_count: %u\n", vol.attr_list_count);
 	print("unnamed_count: %u\n", vol.unnamed_count);
 	print("dataless_count: %u\n", vol.dataless_count);
+	f64 ms = vol.waiting_for_io_time * 1024;
+	print("Time idle waiting for disk: %f ms\n", ms);
+	f64 mb = (f64)vol.bytes_read/1024.0/1024.0;
+	print("File record bytes read: %f MB\n", mb);
 	print("Total file records processed: %u\n", vol.entry_count);
 	for (u64 i = 0; i < timestamp_count; i += 1) {
 		Timestamp *ts = &timestamps[i];
-		f64 ms = ts->accum * 1000.0;
+		ms = ts->accum * 1000.0;
 		
 		print("\t%s: %f ms\n", ts->label, ms);
 	}
@@ -1315,6 +1467,9 @@ int gui_callback(struct nk_context *ctx)
 	nk_layout_row_dynamic(ctx, 30, 2);
 	if (nk_button_label(ctx, "Search")) {
 		
+		for (u64 i = 0; i < query_count; i += 1) {
+			query_free(queries[i]);
+		}
 		query_count = 0;
 		
 		string dirs = STR(dir);
@@ -1325,7 +1480,7 @@ int gui_callback(struct nk_context *ctx)
 		bool one_volume = dir_colon_index != -1;
 		
 		for (u64 i = 0; i < state.vol_count; i += 1) {
-			Volume_Database vol = state.vols[i];
+			Volume_Database vol = state.vol_states[i].vol;
 			
 			if (one_volume) {
 				
@@ -1354,6 +1509,9 @@ int gui_callback(struct nk_context *ctx)
 		selected = -1;
 	}
 	if (nk_button_label(ctx, "Clear")) {
+		for (u64 i = 0; i < query_count; i += 1) {
+			query_free(queries[i]);
+		}
 		query_count = 0;
 		selected     = -1;
 	}
@@ -1362,6 +1520,21 @@ int gui_callback(struct nk_context *ctx)
 	struct nk_rect last = nk_widget_bounds(ctx);
 	float used = (last.y + last.h) - region.y;
 	float remaining = region.h - used;
+	
+	for (u64 i = 0; i < state.vol_count; i += 1) {
+		Volume_State *vstate = state.vol_states + i;
+		
+		if (vstate->vol.done) {
+			string text = tprint("%s: Done (%f seconds)", vstate->vol.name, vstate->indexing_pipe.duration_seconds);
+			nk_text(ctx, (char*)text.data, (int)text.count, NK_TEXT_LEFT);
+		} else if (!vstate->indexing_pipe.done) {
+			string text = tprint("%s: Indexing ...", vstate->vol.name);
+			nk_text(ctx, (char*)text.data, (int)text.count, NK_TEXT_LEFT);
+		} else {
+			string text = tprint("%s: Error", vstate->vol.name);
+			nk_text(ctx, (char*)text.data, (int)text.count, NK_TEXT_LEFT);
+		}
+	}
 	
 	nk_layout_row_dynamic(ctx, remaining, 1);
 	if (nk_group_scrolled_begin(ctx,
@@ -1389,9 +1562,76 @@ int gui_callback(struct nk_context *ctx)
 	return 1;
 }
 
+unit_local bool gui_running = true;
+unit_local Task task_buffer[1024]; // Circular buffer
+unit_local u64 next_task_work_index = 0;
+unit_local u64 next_task_submit_index = 0;
+unit_local u64 task_count = 0;
+unit_local Semaphore task_sem;
+
+s64 task_thread(Thread *t) {
+	(void)t;
+	
+	while (gui_running) {
+		
+		sys_semaphore_wait(task_sem);
+		
+		if (!gui_running) break;
+		
+		assert(task_count > 0);
+		sys_atomic_add_64(&task_count, (u64)-1);
+		assert(task_count < 1024);
+		
+		u64 task_index = sys_atomic_add_64(&next_task_work_index, 1) % 1024;
+		
+		Task *task = &task_buffer[task_index];
+		*task->result = (Task_Pipe){0};
+		
+		f64 t0 = sys_get_seconds_monotonic();
+		
+		switch (task->kind) {
+			case TASK_INDEX_VOLUME: {
+				task->result->success = index_volume(task->volume_name, task->vol);
+				break;
+			}
+			case TASK_QUERY_VOLUME: {
+				task->result->partial = !task->vol->done;
+				Disk_Entry *search_directory_entry = full_path_to_entry_directory(*task->vol, task->search_directory);
+				*task->query = query_volume(*task->vol, search_directory_entry, task->filters, task->filter_count);
+				task->result->success = true;
+				break;
+			}
+			
+			default: assert(false); break;
+		}
+		f64 t1 = sys_get_seconds_monotonic();
+		
+		task->result->duration_seconds = t1-t0;
+		task->result->done = true;
+	}
+	
+	return 0;
+}
+
 int gui_loop(void) {
 	
+	sys_semaphore_init(&task_sem);
+	
+	System_Info sys_info = sys_get_info();
+	
 	Arena arena = make_arena(GiB(8), KiB(32));
+	
+	
+	u64 thread_count = (u64)max(((f64)sys_info.logical_cpu_count * 0.75), 1);
+	Thread *task_threads = (Thread*)arena_push(&arena, sizeof(Thread)*thread_count);
+	
+	for (u64 i = 0; i < thread_count; i += 1) {
+		Thread *thread = task_threads + i;
+		sys_thread_init(thread, task_thread, 0);
+		sys_thread_start(thread);
+	}
+	
+	state.vol_states = (Volume_State*)arena_push(&arena, sizeof(Volume_State)*256);
 	
 	u64 names_size = (u64)GetLogicalDriveStringsA(0, 0);
 	u8 *names_buffer = (u8*)arena_push(&arena, names_size);
@@ -1406,15 +1646,35 @@ int gui_loop(void) {
 		if (colon_index > 0) {
 			
 			string volume_name = string_slice(str, 0, (u64)colon_index);
+			Volume_State *vstate = state.vol_states + (state.vol_count++);
+			*vstate = (Volume_State){0};
 			
-			print("Indexing volume '%s'\n", volume_name);
+			u64 index = sys_atomic_add_64(&next_task_submit_index, 1) % 1024;
+			
+			Task *task = &task_buffer[index];
+			*task = (Task){0};
+			task->vol = &vstate->vol;
+			task->volume_name = volume_name;
+			task->kind = TASK_INDEX_VOLUME;
+			
+			task->result = &vstate->indexing_pipe;
+			
+			sys_atomic_add_64(&task_count, 1);
+			assert(task_count <= 1024);
+			
+			sys_semaphore_signal(&task_sem);
+			
+			
+			/*print("Indexing volume '%s'\n", volume_name);
 			bool ok = index_volume(volume_name, &state.vols[state.vol_count++]);
 			if (!ok) {
 				print("Failed indexing volume '%s'\n", volume_name);
 				state.vol_count -= 1;
 			} else {
 				print("Indexed volume '%s'\n", volume_name);
-			}
+			}*/
+			
+			
 		}
 		
 		next += str.count+1;
@@ -1432,11 +1692,11 @@ int gui_loop(void) {
 	w1.cb_on_draw = &gui_callback;
 	nkgdi_window_create(&w1, 1024, 1024, "nowgrep", 520, 10);
 	
-	f64 target_ms = 1.0/240.0;
+	f64 target_ms = 1.0/60.0;
 	
 	f64 last_time = sys_get_seconds_monotonic();
 	
-	while (nkgdi_window_update(&w1)) {
+	while (nkgdi_window_update(&w1) && gui_running) {
 		reset_temporary_storage();
 		f64 now = sys_get_seconds_monotonic();
 		f64 delta = now - last_time;
@@ -1453,8 +1713,22 @@ int gui_loop(void) {
 		last_time = sys_get_seconds_monotonic();
 	}
 	
+	gui_running = false;
+	
 	nkgdi_window_destroy(&w1);
 	
 	nkgdi_window_shutdown();
+	
+	print("Waiting for task threads to finish...\n");
+	for (u64 i = 0; i < thread_count; i += 1) {
+		sys_semaphore_signal(&task_sem);
+	}
+	for (u64 i = 0; i < thread_count; i += 1) {
+		Thread *thread = task_threads + i;
+		sys_thread_join(thread);
+		sys_thread_close(thread);
+	}
+	print("All task threads are done.\n");
+	
 	return 0;
 }
