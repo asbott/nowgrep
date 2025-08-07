@@ -153,6 +153,7 @@ typedef enum Attribute_Type {
 	ATTR_SECURITY_DESCRIPTOR = 0x50,
 	ATTR_DATA = 0x80,
 	ATTR_INDEX_ROOT = 0x90,
+	ATTR_REPARSE_POINT = 0x90,
 	
 	ATTR_LOGGED_UTILITY_STREAM = 0x100,
 } Attribute_Type;
@@ -272,6 +273,32 @@ typedef struct File_Name {
 	u16 name[];
 } File_Name;
 
+#define REPARSE_Is_alias (0x20000000)
+#define REPARSE_Is_High_Latency (0x40000000)
+#define REPARSE_Is_Microsoft (0x80000000)
+#define REPARSE_NSS (0x68000005)
+#define REPARSE_NSS_Recover (0x68000006)
+#define REPARSE_SIS (0x68000007)
+#define REPARSE_DFS (0x68000008)
+#define REPARSE_Mount_Point (0x88000003)
+#define REPARSE_HSM (0xA8000004)
+#define REPARSE_Symbolic_Link (0xE8000000)
+
+typedef struct Reparse_Point {
+	u32 flags;
+	u16 length;
+	u16 padding;
+	u8 data_and_maybe_third_party_guid[]; // If not microsoft, it's "third party"
+} Reparse_Point;
+
+typedef struct Reparse_Data_Symbolic_Link {
+	u16 name_offset;
+	u16 name_length;
+	u16 print_name_offset;
+	u16 print_name_length;
+	u16 path_buffer;
+} Reparse_Data_Symbolic_Link;
+
 typedef struct File_Record {
 	u8 magic[4]; // F I L E
 	u16 offset_to_update_sequence;
@@ -292,12 +319,21 @@ typedef struct File_Record {
 
 #pragma pack(pop)
 
-// @todo compress this as much as possible
+// @todo @memory compress this as much as possible
+// - u32 entry indices instead of pointers
+// - u16 string length? Make name u32 offset into string pool, u16 length (u48 total, currently u128)
+// - Flags
 typedef struct Entry {
+
+	struct Entry *symlink;
+
 	struct Entry **pointer_to_parent_entry;
 	string name;
-	u8 *data; // If resident: file contents, otherwise data runs
+	u8 *data; // If resident: file contents, otherwise data runs.
 	u64 size; // Size of file data
+	
+	struct Entry *next_sibling;
+	struct Entry *first_child;
 	
 	// Mike acton would cry (@todo flags)
 	bool resident; // If resident, offset is to raw data, if non resident, offset is to data runs
@@ -307,6 +343,11 @@ typedef struct Entry {
 	bool was_searched;
 	bool is_attr_list;
 } Entry;
+
+typedef struct Resolve_Weird_Alias_Job {
+	string name;
+	Entry *alias_entry;
+} Resolve_Weird_Alias_Job;
 
 typedef struct Volume_Database {
 	Ntfs_Boot_Sector boot;
@@ -318,7 +359,7 @@ typedef struct Volume_Database {
 	Entry *entries;
 	u64 entry_count;
 	
-	Arena entry_data_arena; // Small file contents & data runs
+	Arena entry_data_arena; // Small file contents & data runs ++ entry name strings
 								   // (Cached to avoid extremely slow scattered ReadFile calls)
 								   // @memory investigate how much this increases ram usage of the program. Compress ?
 	
@@ -528,6 +569,10 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 	mv.QuadPart = (LONGLONG)mft_offset;
 	LARGE_INTEGER new_pointer;
 	SetFilePointerEx(f, mv, &new_pointer, 0/*FILE_BEGIN*/);
+	
+	Resolve_Weird_Alias_Job *resolve_jobs;
+	// @leak
+	persistent_array_init((void**)&resolve_jobs, sizeof(Resolve_Weird_Alias_Job));
 	
 	u8* file_record_buffer = PushTempBuffer(u8, record_size+boot->bytes_per_sector);
 	file_record_buffer = (u8*)(uintptr)align_next((u64)file_record_buffer, boot->bytes_per_sector);
@@ -799,6 +844,9 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 					continue;
 				}
 				
+				bool has_had_weird_alias_thing = false;
+				string weird_alias_thing = STR("");
+				
 				next_entry->is_directory = (rec->flags & FILE_RECORD_FLAGS_DIRECTORY) != 0;
 				bool has_attr_list = false;
 				bool has_name = false;
@@ -812,26 +860,41 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 					bool attr_named = attr_header_base->name_length > 0;
 					bool resident = attr_header_base->non_resident == 0;
 					
-					if (attr_header_base->type == ATTR_FILE_NAME) {
+					if (attr_header_base->type == ATTR_FILE_NAME /*&& !has_name  @todo, symlinks? */) {
 						assert(!attr_named && resident);
-						
-						has_name = true;
 						
 						Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
 						
 						File_Name *attr = (File_Name *)(attr_header->attr_and_maybe_name);
 						
-						string name = string_allocate(get_temp(), attr->file_name_length*3+1);
+						string name = string_allocate(arena_allocator(&vol->entry_data_arena), attr->file_name_length*3+1);
 						
 						name.count = (u64)WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)attr->name, (int)attr->file_name_length, (char*)name.data, (int)name.count, 0, 0);
 						
-						next_entry->name = name;
+						bool is_weird_alias_thing = string_ends_with(name, STR("~1"));
+						if (!is_weird_alias_thing || !has_name) {
+							next_entry->name = name;
+							
+							if (attr->parent_file_reference != 0) {
+								u64 parent_index = attr->parent_file_reference & 0x0000ffffffffffff;
+								next_entry->pointer_to_parent_entry = vol->entries_per_record + parent_index;
+							} else {
+								next_entry->valid = false;
+							}
+							
+							has_name = true;
+							
+							if (has_had_weird_alias_thing) {
+								Resolve_Weird_Alias_Job *job = (Resolve_Weird_Alias_Job*)persistent_array_push_empty(resolve_jobs);
+								*job = (Resolve_Weird_Alias_Job){0};
+								job->name = weird_alias_thing;
+								job->alias_entry = next_entry;
+							}
+						}
 						
-						if (attr->parent_file_reference != 0) {
-							u64 parent_index = attr->parent_file_reference & 0x0000ffffffffffff;
-							next_entry->pointer_to_parent_entry = vol->entries_per_record + parent_index;
-						} else {
-							next_entry->valid = false;
+						if (is_weird_alias_thing) {
+							weird_alias_thing = name;
+							has_had_weird_alias_thing = true;
 						}
 						
 						if (strings_match(name, STR("."))) {
@@ -901,6 +964,77 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 			processed_record_count += to_process;
 		}
 	}
+	
+	// @cleanup
+	/*timestamp_begin(STR("Resolve weird alias things"));
+	// @speed, O(nm), can be slow if a lot of weird alias things.
+	u64 c = persistent_array_count(resolve_jobs);
+	print("AAA: %u\n", c);
+	for (u64 i = 0; i < persistent_array_count(resolve_jobs); i += 1) {
+		Resolve_Weird_Alias_Job *job = resolve_jobs + 1;
+			print("%s\n", job->name);
+		
+		for (u64 j = 0; j < vol->entry_count; j += 1) {
+			Entry *entry = vol->entries + j;
+			if (!entry->valid) continue;
+			if (entry == job->alias_entry) continue;
+			
+			if (*job->alias_entry->pointer_to_parent_entry == *entry->pointer_to_parent_entry 
+					&& strings_match(entry->name, job->name)) {
+				job->alias_entry->symlink = &entry;
+				__debugbreak();
+				break;
+			}
+		}
+	}
+	timestamp_end(STR("Resolve weird alias things"));*/
+	
+	timestamp_begin(STR("Resolve weird alias things"));
+	for (u64 i = 0; i < vol->entry_count; i += 1) {
+		Entry *entry = vol->entries + i;
+		
+		//if (!entry->valid) continue;
+		if (!entry->pointer_to_parent_entry) continue;
+		
+		Entry *p = *entry->pointer_to_parent_entry;
+		
+		if (!p->first_child) {
+			p->first_child = entry;
+		} else {
+			entry->next_sibling = p->first_child;
+			p->first_child = entry;
+		}
+	}
+	for (u64 i = 0; i < vol->entry_count; i += 1) {
+		Entry *entry = vol->entries + i;
+		
+		//if (!entry->valid) continue;
+		if (!entry->pointer_to_parent_entry) continue;
+		
+		Entry *p = *entry->pointer_to_parent_entry;
+		
+		if (strings_match(p->name, STR("DOWNLO~1"))) {
+			//__debugbreak();
+		}
+	}
+	
+	for (u64 i = 0; i < persistent_array_count(resolve_jobs); i += 1) {
+		Resolve_Weird_Alias_Job *job = resolve_jobs + i;
+		
+		if (strings_match(job->alias_entry->name, STR("Downloads"))) __debugbreak();
+		
+		Entry *next = (*job->alias_entry->pointer_to_parent_entry)->first_child;
+		
+		while (next) {
+			if (next != job->alias_entry && strings_match(next->name, job->name)) {
+				job->alias_entry->symlink = next;
+				__debugbreak();
+				break;
+			}
+			next = next->next_sibling;
+		}
+	}
+	timestamp_end(STR("Resolve weird alias things"));
 	
 	if (!is_command_line) {
 		for (u64 k = 0; k < max_readback_count; k += 1) CloseHandle(events[k]);
@@ -1515,10 +1649,14 @@ Query query_volume(Volume_Database vol, Entry *directory, string *filters, u64 f
 	for (u64 i = 0; i < vol.entry_count; i += 1) {
 		Entry *entry = &vol.entries[i];
 		
+		
 		if (!entry->valid)          continue;
+		//Entry *p = *entry->pointer_to_parent_entry;
+		//if (strings_match(p->name, STR("DOWNLO~1")) && strings_match((*p->pointer_to_parent_entry)->name, STR("charl"))) __debugbreak();
 		if (!entry->ready)          continue;
-		if (entry->is_directory)    continue;
 		if (entry->name.count == 0) continue;
+		
+		if (entry->is_directory)    continue;
 		
 		if (entry->pointer_to_parent_entry) {
 			bool search_dir_is_ancestor = false;
@@ -1541,62 +1679,76 @@ Query query_volume(Volume_Database vol, Entry *directory, string *filters, u64 f
 	timestamp_end(STR("Find children of search directory"));
 	
 	timestamp_begin(STR("Find children which match filter"));
-	for (u64 i = 0; i < persistent_array_count(query.child_entries); i += 1) {
-		Entry *entry = query.child_entries[i];
-		bool any_match = false;
-		
-		string name = entry->name;
-		
-		for (u64 k = 0; k < filter_count; k += 1) {
-			string filter = filters[k];
-			bool prefix_wildcard = filter.data[0] == '*';
-			bool suffix_wildcard = filter.data[filter.count-1] == '*';
-			
-			if (!prefix_wildcard && !suffix_wildcard) {
-				if (strings_match(filter, name)) {
-					any_match = true;
-					break;
-				}
-			}
-			
-			if (prefix_wildcard && !suffix_wildcard) {
-				string end = filter;
-				end.data += 1;
-				end.count -= 1;
-				
-				if (string_ends_with(name, end)) {
-					any_match = true;
-					break;
-				}
-			}
-			
-			if (!prefix_wildcard && suffix_wildcard) {
-				string start = filter;
-				start.count -= 1;
-				
-				if (string_starts_with(name, start)) {
-					any_match = true;
-					break;
-				}
-			}
-			
-			if (prefix_wildcard && suffix_wildcard) {
-				string middle = filter;
-				middle.count -= 2;
-				middle.data += 1;
-				
-				if (string_find_index_from_left(name, middle) != -1) {
-					any_match = true;
-					break;
-				}
-			}
-			
-		}
-		
-		if (any_match) {
+	if (filter_count == 0) {
+		for (u64 i = 0; i < persistent_array_count(query.child_entries); i += 1) {
+			Entry *entry = query.child_entries[i];
 			entry->was_searched = false;
 			persistent_array_push_copy(query.filtered_entries, &entry);
 			sys_semaphore_signal(&query.ctx.found_entry_sem);
+		}
+	} else {
+		for (u64 i = 0; i < persistent_array_count(query.child_entries); i += 1) {
+			Entry *entry = query.child_entries[i];
+			bool any_match = false;
+			
+			string name = entry->name;
+			
+			for (u64 k = 0; k < filter_count; k += 1) {
+				string filter = filters[k];
+				bool prefix_wildcard = filter.data[0] == '*';
+				bool suffix_wildcard = filter.data[filter.count-1] == '*';
+				
+				if (strings_match(string_trim(filter), STR("*"))) {
+					any_match  = true;
+					break;
+				}
+				
+				if (!prefix_wildcard && !suffix_wildcard) {
+					if (strings_match(filter, name)) {
+						any_match = true;
+						break;
+					}
+				}
+				
+				if (prefix_wildcard && !suffix_wildcard) {
+					string end = filter;
+					end.data += 1;
+					end.count -= 1;
+					
+					if (string_ends_with(name, end)) {
+						any_match = true;
+						break;
+					}
+				}
+				
+				if (!prefix_wildcard && suffix_wildcard) {
+					string start = filter;
+					start.count -= 1;
+					
+					if (string_starts_with(name, start)) {
+						any_match = true;
+						break;
+					}
+				}
+				
+				if (prefix_wildcard && suffix_wildcard) {
+					string middle = filter;
+					middle.count -= 2;
+					middle.data += 1;
+					
+					if (string_find_index_from_left(name, middle) != -1) {
+						any_match = true;
+						break;
+					}
+				}
+				
+			}
+			
+			if (any_match) {
+				entry->was_searched = false;
+				persistent_array_push_copy(query.filtered_entries, &entry);
+				sys_semaphore_signal(&query.ctx.found_entry_sem);
+			}
 		}
 	}
 	timestamp_end(STR("Find children which match filter"));
@@ -1912,6 +2064,9 @@ int gui_callback(struct nk_context *ctx)
 		}
 		query_count = 0;
 		selected     = -1;
+	}
+	if (nk_button_label(ctx, "debugbreak")) {
+		__debugbreak();
 	}
 	
 	struct nk_rect region = nk_window_get_content_region(ctx);
