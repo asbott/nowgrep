@@ -190,16 +190,6 @@ typedef struct Attribute_Header_Non_Resident {
 	u8 runs_and_maybe_name[];
 } Attribute_Header_Non_Resident;
 
-typedef struct Attribute_List {
-	Attribute_Type type;
-	u16 record_length;
-	u8 name_length;
-	u8 offset_to_name;
-	u64 starting_vcn;
-	u64 base_file_reference;
-	u16 attribute_id;
-	u16 name[];
-} Attribute_List;
 
 typedef enum File_Permission {
 	FILE_PERMISSION_Read_Only = 0x0001,
@@ -299,6 +289,17 @@ typedef struct Reparse_Data_Symbolic_Link {
 	u16 path_buffer;
 } Reparse_Data_Symbolic_Link;
 
+typedef struct Attribute_List_Record {
+	Attribute_Type type;
+	u16 record_length;
+	u8 name_length;
+	u8 name_offset;
+	u64 starting_vcn;
+	u64 base_file_reference_of_attribute;
+	u16 attribute_id;
+	u16 name[];
+} Attribute_List_Record;
+
 typedef struct File_Record {
 	u8 magic[4]; // F I L E
 	u16 offset_to_update_sequence;
@@ -325,15 +326,15 @@ typedef struct File_Record {
 // - Flags
 typedef struct Entry {
 
-	struct Entry *symlink;
 
 	struct Entry **pointer_to_parent_entry;
 	string name;
 	u8 *data; // If resident: file contents, otherwise data runs.
 	u64 size; // Size of file data
 	
-	struct Entry *next_sibling;
-	struct Entry *first_child;
+	//struct Entry *symlink;
+	//struct Entry *next_sibling;
+	//struct Entry *first_child;
 	
 	// Mike acton would cry (@todo flags)
 	bool resident; // If resident, offset is to raw data, if non resident, offset is to data runs
@@ -501,6 +502,291 @@ unit_local u64 max_streaming_memory = GiB(3);
 unit_local bool is_entire_volume_search = false;
 unit_local bool is_command_line = false;
 
+// @speed very slow but works for now
+// - Sorting with a radix/base of 10. Should do 256 (that way each "digit" is a byte),
+//		and the number of passes is lowered to 8 while keeping stack memory usage reasonable.
+// - Maybe theres a more efficient way to do the rearranging for each pass counting sort
+void radix_sort(void *items, u64 item_size, u64 item_count, u64 offset_to_sorting_number, u64 sorting_number_bit_width) {
+	if (sorting_number_bit_width > 64) return;
+	
+	static const u64 POW10[20] = {
+	    1ULL,
+	    10ULL,
+	    100ULL,
+	    1000ULL,
+	    10000ULL,
+	    100000ULL,
+	    1000000ULL,
+	    10000000ULL,
+	    100000000ULL,
+	    1000000000ULL,
+	    10000000000ULL,
+	    100000000000ULL,
+	    1000000000000ULL,
+	    10000000000000ULL,
+	    100000000000000ULL,
+	    1000000000000000ULL,
+	    10000000000000000ULL,
+	    100000000000000000ULL,
+	    1000000000000000000ULL,
+	    10000000000000000000ULL
+	};
+	
+	u64 nbytes = (sorting_number_bit_width+7)/8;
+
+	// @todo temporary storage save point
+	void *swap_space = PushTempBuffer(u8, item_size);
+	
+	// @speed maybe we could have an optional hint for the max value, so we can know
+	// max digit count.
+	u64 max_num = 0;
+	for (u64 i = 0; i < item_count; i += 1) {
+		u64 num = 0;
+		memcpy(&num, (u8*)items+i*item_size + offset_to_sorting_number, nbytes);
+		max_num = max(num, max_num);
+	}
+	
+	u64 pass_count = 0;
+	pass_count += max_num >= 1ULL;
+	pass_count += max_num >= 10ULL;
+	pass_count += max_num >= 100ULL;
+	pass_count += max_num >= 1000ULL;
+	pass_count += max_num >= 10000ULL;
+	pass_count += max_num >= 100000ULL;
+	pass_count += max_num >= 1000000ULL;
+	pass_count += max_num >= 10000000ULL;
+	pass_count += max_num >= 100000000ULL;
+	pass_count += max_num >= 1000000000ULL;
+	pass_count += max_num >= 10000000000ULL;
+	pass_count += max_num >= 100000000000ULL;
+	pass_count += max_num >= 1000000000000ULL;
+	pass_count += max_num >= 10000000000000ULL;
+	pass_count += max_num >= 100000000000000ULL;
+	pass_count += max_num >= 1000000000000000ULL;
+	pass_count += max_num >= 10000000000000000ULL;
+	pass_count += max_num >= 100000000000000000ULL;
+	pass_count += max_num >= 1000000000000000000ULL;
+	pass_count += max_num >= 10000000000000000000ULL;
+	
+	for (u64 pass = 0; pass < pass_count; pass += 1) {
+		u64 starts[10] = {0};
+		u64 ends[10] = {0};
+		
+		///
+		// Counting sort for each pass
+		
+		// Get count of each number
+		for (u64 i = 0; i < item_count; i += 1) {
+			u64 num = 0;
+			memcpy(&num, (u8*)items+i*item_size + offset_to_sorting_number, nbytes);
+			
+			u64 digit = (num / POW10[pass]) % 10;
+			
+			starts[digit] += 1;
+		}
+		
+		// Do the sum thing
+		for (u64 i = 1; i < 10; i += 1) {
+			starts[i] += starts[i-1];
+		}
+		
+		// Do the shift thing
+		for (u64 i = 9; i >= 1; i -= 1) {
+			starts[i] = starts[i-1];
+		}
+		starts[0] = 0;
+		
+		for (u64 i = 0; i < 9; i += 1) {
+			ends[i] = starts[i+1];
+		}
+		ends[9] = item_count;
+		
+		u64 next_free[10];
+		memcpy(next_free, starts, sizeof(starts));
+		
+		// Sort elements in-place
+		for (u64 i = 0; i < item_count; i += 1) {
+			u8 *src_guy = (u8*)items+i*item_size;
+				
+			u64 num = 0;
+			memcpy(&num, src_guy + offset_to_sorting_number, nbytes);
+			u64 digit = (num / POW10[pass]) % 10;
+			
+			for (u64 b = 0; b < 10; b += 1) {
+				if (digit == b) {
+				
+					if (i >= starts[b] && i < ends[b]) {
+						// This guy is already in his stable sorted place.
+						next_free[b] += 1;
+						if (next_free[b] >= ends[b]) break;
+					} else {
+						u8 *dst_guy = (u8*)items+next_free[b]*item_size;
+						next_free[b] += 1;
+						
+						memcpy(swap_space, dst_guy, item_size);
+						memcpy(dst_guy, src_guy, item_size);
+						memcpy(src_guy, swap_space, item_size);
+						
+						if (next_free[b] >= ends[b]) break;
+						
+						i -= 1; // We swapped a new guy into this slot whom we need to reconsider
+					}
+					break;
+				}
+			}
+		}
+	}
+}
+
+typedef struct Attribute_Processing_Context {
+	Resolve_Weird_Alias_Job *resolve_jobs;
+	string weird_alias_thing;
+	u64 readback_next_position;
+	u64 records_bytes_queued;
+	u64 max_readback_memory;
+	u8 *records_buffer;
+	File_Record *rec;
+	bool has_name;
+	bool has_had_weird_alias_thing;
+} Attribute_Processing_Context;
+
+bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, Attribute_Header_Base *attr_header_base, Entry *next_entry) {
+
+	bool attr_named = attr_header_base->name_length > 0;
+	bool resident = attr_header_base->non_resident == 0;
+	
+	if (attr_header_base->type == ATTR_FILE_NAME /*&& !has_name  @todo, symlinks? */) {
+		assert(!attr_named && resident);
+		
+		Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
+		
+		File_Name *attr = (File_Name *)(attr_header->attr_and_maybe_name);
+		
+		string name = string_allocate(arena_allocator(&vol->entry_data_arena), attr->file_name_length*3+1);
+		
+		name.count = (u64)WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)attr->name, (int)attr->file_name_length, (char*)name.data, (int)name.count, 0, 0);
+		
+		//if (strings_match(STR("Software"), name)) __debugbreak();
+		
+		bool is_weird_alias_thing = string_ends_with(name, STR("~1"));
+		if (!is_weird_alias_thing || !ctx->has_name) {
+			next_entry->name = name;
+			
+			if (attr->parent_file_reference != 0) {
+				u64 parent_index = attr->parent_file_reference & 0x0000ffffffffffff;
+				next_entry->pointer_to_parent_entry = vol->entries_per_record + parent_index;
+			} else {
+				next_entry->valid = false;
+			}
+			
+			ctx->has_name = true;
+			
+			if (ctx->has_had_weird_alias_thing) {
+				Resolve_Weird_Alias_Job *job = (Resolve_Weird_Alias_Job*)persistent_array_push_empty(ctx->resolve_jobs);
+				*job = (Resolve_Weird_Alias_Job){0};
+				job->name = ctx->weird_alias_thing;
+				job->alias_entry = next_entry;
+			}
+		}
+		
+		if (is_weird_alias_thing) {
+			ctx->weird_alias_thing = name;
+			ctx->has_had_weird_alias_thing = true;
+		}
+		
+		if (strings_match(name, STR("."))) {
+			vol->root_entry = next_entry;
+		}
+		
+		
+	} else if (attr_header_base->type == ATTR_DATA && !next_entry->is_directory && !attr_named) {
+		next_entry->resident = resident;
+		
+		if (resident) {
+			Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
+			next_entry->size = attr_header->attribute_length;
+			void *attrib_data = (u8*)attr_header + attr_header->attribute_offset;
+			next_entry->data = arena_push_copy(&vol->entry_data_arena, attrib_data, next_entry->size);
+		} else {
+			Attribute_Header_Non_Resident *attr_header = (Attribute_Header_Non_Resident *)attr_header_base;
+			u64 data_run_size = ((u64)attr_header->base.length_including_header - (u64)attr_header->offset_to_data_runs);
+			next_entry->size = attr_header->attribute_real_size;
+			void *attrib_data = (u8*)attr_header + attr_header->offset_to_data_runs;
+			next_entry->data = arena_push_copy(&vol->entry_data_arena, attrib_data, data_run_size);
+		}
+	}
+	
+	// This attribute is not like other attributes so it will break stuff
+	if (attr_header_base->type == ATTR_LOGGED_UTILITY_STREAM) {
+		next_entry->ready = true; // @todo
+		return false; // break attribute looping
+	}
+	
+	if (attr_header_base->type == ATTR_ATTRIBUTE_LIST) {
+		if (attr_named) print("Unhandled: named attribute list\n");
+		else {
+			if (resident) {
+				Attribute_Header_Resident *attr_header 
+					= (Attribute_Header_Resident *)attr_header_base;
+				Attribute_List_Record *item 
+					= (Attribute_List_Record*)attr_header->attr_and_maybe_name;
+				
+				while ((u8*)item < (u8*)attr_header+attr_header_base->length_including_header) {
+					u64 frn = item->base_file_reference_of_attribute;
+					
+					u64 file_record_index = frn & 0x0000ffffffffffff;
+					//__debugbreak();
+					//u64 expected_sequence_number = (frn & 0xFFFF) >> 48;
+					
+					u64 alive_end = ctx->readback_next_position*BYTES_PER_READBACK;
+					u64 alive_start 
+						= ctx->records_bytes_queued >= max_streaming_memory
+						? ctx->records_bytes_queued - max_streaming_memory
+						: 0;
+					assert(alive_end > alive_start);
+					
+					u64 byte_index = file_record_index*vol->record_size;
+					
+					if (byte_index >= alive_start && byte_index < alive_end) {
+						// This is in memory, we can handle it now
+						
+						File_Record *other_rec 
+							= (File_Record*)(ctx->records_buffer + (byte_index%ctx->max_readback_memory));
+						Attribute_Header_Base *other_attr_header 
+							= (Attribute_Header_Base *)((u8*)other_rec + other_rec->first_attribute_offset);
+						
+						while ((u64)other_attr_header < (u64)other_rec + other_rec->file_record_real_size && *(u32*)other_attr_header != 0xFFFFFFFF) {
+							
+							if (other_attr_header != attr_header_base && other_rec != ctx->rec) {
+								if (!process_attribute(ctx, vol, other_attr_header, next_entry))
+									break;
+							}
+							
+							
+							other_attr_header = (Attribute_Header_Base*)((u8*)other_attr_header + other_attr_header->length_including_header);
+						}
+						
+					} else {
+						static u64 n = 0;
+						print("Unhandled: Attribute list record not in memory (%u, %u)\n", n, file_record_index);
+						n += 1;
+						break;
+					}
+					
+					item = (Attribute_List_Record*)((u8*)item + item->record_length);
+				}
+				
+			} else {
+				static u64 n = 0;
+				print("Unhandled: non-resident attribute list (%u)\n", n);
+				n += 1;
+			}
+		}
+	}
+	
+	return true;
+}
+
 bool index_volume(string volume_name, Volume_Database *vol) {
 	
 	if (max_streaming_memory < MAX_BYTES_PER_WORK) {
@@ -523,12 +809,12 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 	File_Handle f = CreateFileW(
 		cpath, GENERIC_READ,
 		FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-		0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING, 0
+		0, OPEN_EXISTING, 0, 0
 	);
 	File_Handle fasync = CreateFileW(
 		cpath, GENERIC_READ,
 		FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-		0, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, 0
+		0, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0
 	);
 	
 	if (f == (File_Handle)0xffffffffffffffff) {
@@ -703,8 +989,8 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 	memset(events, 0, sizeof(HANDLE)*max_readback_count);
 	memset(read_sizes, 0, sizeof(u64)*max_readback_count);
 	u64 readback_count = 0;
-	u64 readback_next_position = 0;
 	u64 readback_place_position = 0;
+	u64 readback_next_position = 0;
 	
 	for (u64 i = 0; i < max_readback_count; i += 1) {
 		events[i] = CreateEventA(0, 1, 0, 0);
@@ -790,6 +1076,7 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 				readback_data = records_buffer + (readback_next_position%max_readback_count)*BYTES_PER_READBACK;
 				
 				readback_next_position += 1;
+				assert(readback_count > 0);
 				sys_atomic_add_64(&readback_count, (u64)-1);
 				
 				// @cleanup
@@ -807,6 +1094,14 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 			
 			tm_scope("Process streamed records")
 			for (u64 j = 0; j < to_process; j += 1) {
+				
+				Attribute_Processing_Context ctx = (Attribute_Processing_Context){0};
+				ctx.resolve_jobs = resolve_jobs;
+				ctx.readback_next_position = readback_next_position;
+				ctx.records_bytes_queued = records_bytes_queued;
+				ctx.max_readback_memory = max_readback_memory;
+				ctx.records_buffer = records_buffer;
+				ctx.rec = rec;
 				
 				Entry *next_entry = vol->entries + (processed_record_count + j);
 				next_entry->valid = true;
@@ -844,12 +1139,7 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 					continue;
 				}
 				
-				bool has_had_weird_alias_thing = false;
-				string weird_alias_thing = STR("");
-				
 				next_entry->is_directory = (rec->flags & FILE_RECORD_FLAGS_DIRECTORY) != 0;
-				bool has_attr_list = false;
-				bool has_name = false;
 				Attribute_Header_Base *attr_header_base = (Attribute_Header_Base *)((u8*)rec + rec->first_attribute_offset);
 				
 				/////
@@ -857,87 +1147,16 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 				
 				while ((u64)attr_header_base < (u64)rec + rec->file_record_real_size && *(u32*)attr_header_base != 0xFFFFFFFF) {
 					
-					bool attr_named = attr_header_base->name_length > 0;
-					bool resident = attr_header_base->non_resident == 0;
-					
-					if (attr_header_base->type == ATTR_FILE_NAME /*&& !has_name  @todo, symlinks? */) {
-						assert(!attr_named && resident);
-						
-						Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
-						
-						File_Name *attr = (File_Name *)(attr_header->attr_and_maybe_name);
-						
-						string name = string_allocate(arena_allocator(&vol->entry_data_arena), attr->file_name_length*3+1);
-						
-						name.count = (u64)WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)attr->name, (int)attr->file_name_length, (char*)name.data, (int)name.count, 0, 0);
-						
-						bool is_weird_alias_thing = string_ends_with(name, STR("~1"));
-						if (!is_weird_alias_thing || !has_name) {
-							next_entry->name = name;
-							
-							if (attr->parent_file_reference != 0) {
-								u64 parent_index = attr->parent_file_reference & 0x0000ffffffffffff;
-								next_entry->pointer_to_parent_entry = vol->entries_per_record + parent_index;
-							} else {
-								next_entry->valid = false;
-							}
-							
-							has_name = true;
-							
-							if (has_had_weird_alias_thing) {
-								Resolve_Weird_Alias_Job *job = (Resolve_Weird_Alias_Job*)persistent_array_push_empty(resolve_jobs);
-								*job = (Resolve_Weird_Alias_Job){0};
-								job->name = weird_alias_thing;
-								job->alias_entry = next_entry;
-							}
-						}
-						
-						if (is_weird_alias_thing) {
-							weird_alias_thing = name;
-							has_had_weird_alias_thing = true;
-						}
-						
-						if (strings_match(name, STR("."))) {
-							vol->root_entry = next_entry;
-						}
-						
-						
-					} else if (attr_header_base->type == ATTR_DATA && !next_entry->is_directory && !attr_named) {
-						next_entry->resident = resident;
-						
-						if (resident) {
-							Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
-							next_entry->size = attr_header->attribute_length;
-							void *attrib_data = (u8*)attr_header + attr_header->attribute_offset;
-							next_entry->data = arena_push_copy(&vol->entry_data_arena, attrib_data, next_entry->size);
-						} else {
-							Attribute_Header_Non_Resident *attr_header = (Attribute_Header_Non_Resident *)attr_header_base;
-							u64 data_run_size = ((u64)attr_header->base.length_including_header - (u64)attr_header->offset_to_data_runs);
-							next_entry->size = attr_header->attribute_real_size;
-							void *attrib_data = (u8*)attr_header + attr_header->offset_to_data_runs;
-							next_entry->data = arena_push_copy(&vol->entry_data_arena, attrib_data, data_run_size);
-						}
-					}
-					
-					// This attribute is not like other attributes so it will break stuff
-					if (attr_header_base->type == ATTR_LOGGED_UTILITY_STREAM) {
-						next_entry->ready = true; // @todo
+					if (!process_attribute(&ctx, vol, attr_header_base, next_entry))
 						break;
-					}
-					
-					// @todo Walk attributes in attribute list 
-					if (attr_header_base->type == ATTR_ATTRIBUTE_LIST) {
-						has_attr_list = true;
-						next_entry->valid = false;
-					}
 					
 					attr_header_base = (Attribute_Header_Base*)((u8*)attr_header_base + attr_header_base->length_including_header);
 				}
 				
+				
 				if (!(rec->flags & FILE_FLAGS_Compressed) && !(rec->flags & FILE_FLAGS_Encrypted)) {
 					vol->entries_per_record[processed_record_count+j] = next_entry;
-					
-					if (!next_entry->is_directory && !string_starts_with(next_entry->name, STR("$")) && !has_attr_list && has_name) {
+					if (!next_entry->is_directory && !string_starts_with(next_entry->name, STR("$")) && ctx.has_name) {
 						if (!next_entry->data) {
 							vol->dataless_count += 1;
 						}
@@ -950,12 +1169,7 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 					vol->compressed_count += 1;
 					next_entry->valid = false; // @todo
 				}
-				if (has_attr_list) {
-					vol->attr_list_count += 1;
-					next_entry->valid = false; // @todo
-					next_entry->is_attr_list = true;
-				}
-				if (!has_name) {
+				if (!ctx.has_name) {
 					vol->unnamed_count += 1;
 					next_entry->valid = false; // @todo
 				}
@@ -964,32 +1178,9 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 			processed_record_count += to_process;
 		}
 	}
+
 	
-	// @cleanup
 	/*timestamp_begin(STR("Resolve weird alias things"));
-	// @speed, O(nm), can be slow if a lot of weird alias things.
-	u64 c = persistent_array_count(resolve_jobs);
-	print("AAA: %u\n", c);
-	for (u64 i = 0; i < persistent_array_count(resolve_jobs); i += 1) {
-		Resolve_Weird_Alias_Job *job = resolve_jobs + 1;
-			print("%s\n", job->name);
-		
-		for (u64 j = 0; j < vol->entry_count; j += 1) {
-			Entry *entry = vol->entries + j;
-			if (!entry->valid) continue;
-			if (entry == job->alias_entry) continue;
-			
-			if (*job->alias_entry->pointer_to_parent_entry == *entry->pointer_to_parent_entry 
-					&& strings_match(entry->name, job->name)) {
-				job->alias_entry->symlink = &entry;
-				__debugbreak();
-				break;
-			}
-		}
-	}
-	timestamp_end(STR("Resolve weird alias things"));*/
-	
-	timestamp_begin(STR("Resolve weird alias things"));
 	for (u64 i = 0; i < vol->entry_count; i += 1) {
 		Entry *entry = vol->entries + i;
 		
@@ -1021,7 +1212,7 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 	for (u64 i = 0; i < persistent_array_count(resolve_jobs); i += 1) {
 		Resolve_Weird_Alias_Job *job = resolve_jobs + i;
 		
-		if (strings_match(job->alias_entry->name, STR("Downloads"))) __debugbreak();
+		//if (strings_match(job->alias_entry->name, STR("Downloads"))) __debugbreak();
 		
 		Entry *next = (*job->alias_entry->pointer_to_parent_entry)->first_child;
 		
@@ -1034,7 +1225,7 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 			next = next->next_sibling;
 		}
 	}
-	timestamp_end(STR("Resolve weird alias things"));
+	timestamp_end(STR("Resolve weird alias things"));*/
 	
 	if (!is_command_line) {
 		for (u64 k = 0; k < max_readback_count; k += 1) CloseHandle(events[k]);
@@ -2046,7 +2237,7 @@ int gui_callback(struct nk_context *ctx)
 					}
 					queries[query_count++] = query_volume(vol, search_directory_entry, filters, filter_count, &search_term, search_term_count, &query_done);
 					
-					//print_stats(vol, queries[query_count-1]);
+					print_stats(vol, queries[query_count-1]);
 					timestamp_count = 0;
 					
 					break;
