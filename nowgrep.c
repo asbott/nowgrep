@@ -103,7 +103,19 @@ void profiler_report_time(string name, f64 count, f64 start) {
 	arena_push_string(&profiler->arena, STR("},"));
 }
 
-#define ENABLE_PROFILING
+//#define ENABLE_PROFILING
+
+f64 seconds_since_init(void) {
+	local_persist f64 start = 0.0;
+	local_persist bool initted = false;
+	
+	if (!initted) {
+		initted = true;
+		start = sys_get_seconds_monotonic();
+	}
+	
+	return sys_get_seconds_monotonic() - start;
+}
 
 #ifdef ENABLE_PROFILING
 #define tm_scope(name) \
@@ -153,9 +165,11 @@ typedef enum Attribute_Type {
 	ATTR_SECURITY_DESCRIPTOR = 0x50,
 	ATTR_DATA = 0x80,
 	ATTR_INDEX_ROOT = 0x90,
-	ATTR_REPARSE_POINT = 0x90,
+	ATTR_REPARSE_POINT = 0xC0,
 	
 	ATTR_LOGGED_UTILITY_STREAM = 0x100,
+	
+	ATTR_HANDLED = (int)0xDEADBEEF,
 } Attribute_Type;
 
 typedef struct Attribute_Header_Base {
@@ -263,6 +277,50 @@ typedef struct File_Name {
 	u16 name[];
 } File_Name;
 
+typedef enum Windows_Reparse_Tag {
+	IO_REPARSE_TAG_MOUNT_POINT      = (s32)0xA0000003L,
+	IO_REPARSE_TAG_HSM              = (s32)0xC0000004L,
+	IO_REPARSE_TAG_HSM2             = (s32)0x80000006L,
+	IO_REPARSE_TAG_SIS              = (s32)0x80000007L,
+	IO_REPARSE_TAG_WIM              = (s32)0x80000008L,
+	IO_REPARSE_TAG_CSV              = (s32)0x80000009L,
+	IO_REPARSE_TAG_DFS              = (s32)0x8000000AL,
+	IO_REPARSE_TAG_SYMLINK          = (s32)0xA000000CL,
+	IO_REPARSE_TAG_DFSR             = (s32)0x80000012L,
+	IO_REPARSE_TAG_DEDUP            = (s32)0x80000013L,
+	IO_REPARSE_TAG_NFS              = (s32)0x80000014L,
+	IO_REPARSE_TAG_FILE_PLACEHOLDER = (s32)0x80000015L,
+	IO_REPARSE_TAG_WOF              = (s32)0x80000017L,
+	IO_REPARSE_TAG_WCI              = (s32)0x80000018L,
+	IO_REPARSE_TAG_WCI_1            = (s32)0x90001018L,
+	IO_REPARSE_TAG_GLOBAL_REPARSE   = (s32)0xA0000019L,
+	IO_REPARSE_TAG_CLOUD            = (s32)0x9000001AL,
+	IO_REPARSE_TAG_CLOUD_1          = (s32)0x9000101AL,
+	IO_REPARSE_TAG_CLOUD_2          = (s32)0x9000201AL,
+	IO_REPARSE_TAG_CLOUD_3          = (s32)0x9000301AL,
+	IO_REPARSE_TAG_CLOUD_4          = (s32)0x9000401AL,
+	IO_REPARSE_TAG_CLOUD_5          = (s32)0x9000501AL,
+	IO_REPARSE_TAG_CLOUD_6          = (s32)0x9000601AL,
+	IO_REPARSE_TAG_CLOUD_7          = (s32)0x9000701AL,
+	IO_REPARSE_TAG_CLOUD_8          = (s32)0x9000801AL,
+	IO_REPARSE_TAG_CLOUD_9          = (s32)0x9000901AL,
+	IO_REPARSE_TAG_CLOUD_A          = (s32)0x9000A01AL,
+	IO_REPARSE_TAG_CLOUD_B          = (s32)0x9000B01AL,
+	IO_REPARSE_TAG_CLOUD_C          = (s32)0x9000C01AL,
+	IO_REPARSE_TAG_CLOUD_D          = (s32)0x9000D01AL,
+	IO_REPARSE_TAG_CLOUD_E          = (s32)0x9000E01AL,
+	IO_REPARSE_TAG_CLOUD_F          = (s32)0x9000F01AL,
+	IO_REPARSE_TAG_CLOUD_MASK       = (s32)0x0000F000L,
+	IO_REPARSE_TAG_APPEXECLINK      = (s32)0x8000001BL,
+	IO_REPARSE_TAG_PROJFS           = (s32)0x9000001CL,
+	IO_REPARSE_TAG_STORAGE_SYNC     = (s32)0x8000001EL,
+	IO_REPARSE_TAG_WCI_TOMBSTONE    = (s32)0xA000001FL,
+	IO_REPARSE_TAG_UNHANDLED        = (s32)0x80000020L,
+	IO_REPARSE_TAG_ONEDRIVE         = (s32)0x80000021L,
+	IO_REPARSE_TAG_PROJFS_TOMBSTONE = (s32)0xA0000022L,
+	IO_REPARSE_TAG_AF_UNIX          = (s32)0x80000023L,
+} Windows_Reparse_Tag;
+
 #define REPARSE_Is_alias (0x20000000)
 #define REPARSE_Is_High_Latency (0x40000000)
 #define REPARSE_Is_Microsoft (0x80000000)
@@ -311,30 +369,72 @@ typedef struct File_Record {
 	u16 flags;
 	u32 file_record_real_size;
 	u32 file_record_allocated_size;
-	u64 base_file_record_reference;
+	u64 base_file_record_reference; // This is only non-zero if this is a dummy file record for holding ATTRIBUTE_LIST entries
 	u16 next_attribute_id;
 	u16 pad;
 	u32 mft_record_number;
+	u16 update_sequence_number;
 	u8 update_sequence[];
 } File_Record;
 
 #pragma pack(pop)
+
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_reparse_data_buffer
+typedef struct REPARSE_DATA_BUFFER {
+	ULONG  ReparseTag;
+	USHORT ReparseDataLength;
+	USHORT Reserved;
+	union {
+		struct {
+			USHORT SubstituteNameOffset;
+			USHORT SubstituteNameLength;
+			USHORT PrintNameOffset;
+			USHORT PrintNameLength;
+			ULONG  Flags;
+			WCHAR  PathBuffer[1];
+		} SymbolicLinkReparseBuffer;
+		struct {
+			USHORT SubstituteNameOffset;
+			USHORT SubstituteNameLength;
+			USHORT PrintNameOffset;
+			USHORT PrintNameLength;
+			WCHAR  PathBuffer[1];
+		} MountPointReparseBuffer;
+		struct {
+			UCHAR DataBuffer[1];
+		} GenericReparseBuffer;
+	} DUMMYUNIONNAME;
+} REPARSE_DATA_BUFFER;
+
+// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information
+typedef struct BY_HANDLE_FILE_INFORMATION {
+  DWORD    dwFileAttributes;
+  FILETIME ftCreationTime;
+  FILETIME ftLastAccessTime;
+  FILETIME ftLastWriteTime;
+  DWORD    dwVolumeSerialNumber;
+  DWORD    nFileSizeHigh;
+  DWORD    nFileSizeLow;
+  DWORD    nNumberOfLinks;
+  DWORD    nFileIndexHigh;
+  DWORD    nFileIndexLow;
+} BY_HANDLE_FILE_INFORMATION, *PBY_HANDLE_FILE_INFORMATION, *LPBY_HANDLE_FILE_INFORMATION;
+// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle
+BOOL GetFileInformationByHandle(HANDLE hFile, LPBY_HANDLE_FILE_INFORMATION lpFileInformation);
 
 // @todo @memory compress this as much as possible
 // - u32 entry indices instead of pointers
 // - u16 string length? Make name u32 offset into string pool, u16 length (u48 total, currently u128)
 // - Flags
 typedef struct Entry {
-
-
-	struct Entry **pointer_to_parent_entry;
+		
 	string name;
 	u8 *data; // If resident: file contents, otherwise data runs.
 	u64 size; // Size of file data
 	
-	//struct Entry *symlink;
-	//struct Entry *next_sibling;
-	//struct Entry *first_child;
+	struct Entry *parent;
+	struct Entry *next_sibling;
+	struct Entry *first_child;
 	
 	// Mike acton would cry (@todo flags)
 	bool resident; // If resident, offset is to raw data, if non resident, offset is to data runs
@@ -342,16 +442,12 @@ typedef struct Entry {
 	bool valid;
 	bool ready;
 	bool was_searched;
-	bool is_attr_list;
+	bool usa_applied;
+	bool is_symlink; // If symlink, first_child is set to the entry being linked to, and all other members are ignored
 } Entry;
 
-typedef struct Resolve_Weird_Alias_Job {
-	string name;
-	Entry *alias_entry;
-} Resolve_Weird_Alias_Job;
-
 typedef struct Volume_Database {
-	Ntfs_Boot_Sector boot;
+	volatile Ntfs_Boot_Sector boot;
 	
 	string name; // C, D, E etc
 	
@@ -360,11 +456,10 @@ typedef struct Volume_Database {
 	Entry *entries;
 	u64 entry_count;
 	
-	Arena entry_data_arena; // Small file contents & data runs ++ entry name strings
-								   // (Cached to avoid extremely slow scattered ReadFile calls)
-								   // @memory investigate how much this increases ram usage of the program. Compress ?
-	
-	Entry **entries_per_record;
+	Arena entry_names_arena; // Small file contents & data runs ++ entry name strings
+	Arena entry_small_data_arena;
+	Arena entry_data_runs_arena;
+	Arena scratch;
 	
 	Entry *root_entry;
 	
@@ -386,8 +481,10 @@ typedef struct Work {
 	Entry *entry;
 	u8* data;
 	u64 size;
+	u64 allocated_size;
 	OVERLAPPED ovl;
 	File_Handle f; // async (OVERLAPEPD)
+	u64 *pointer_to_match_count_for_entry;
 	bool is_async;
 } Work;
 
@@ -428,9 +525,11 @@ typedef struct Query_Context {
 
 typedef struct Query {
 	Volume_Database vol;
-	Entry **child_entries; // persistent array
 	Entry **filtered_entries; // persistent array
 	Match *matches; // persistent array
+	u64 unique_files_with_any_match_count;
+	f64 start_time;
+	f64 end_time;
 	
 	Query_Context ctx;
 } Query;
@@ -510,30 +609,30 @@ void radix_sort(void *items, u64 item_size, u64 item_count, u64 offset_to_sortin
 	if (sorting_number_bit_width > 64) return;
 	
 	static const u64 POW10[20] = {
-	    1ULL,
-	    10ULL,
-	    100ULL,
-	    1000ULL,
-	    10000ULL,
-	    100000ULL,
-	    1000000ULL,
-	    10000000ULL,
-	    100000000ULL,
-	    1000000000ULL,
-	    10000000000ULL,
-	    100000000000ULL,
-	    1000000000000ULL,
-	    10000000000000ULL,
-	    100000000000000ULL,
-	    1000000000000000ULL,
-	    10000000000000000ULL,
-	    100000000000000000ULL,
-	    1000000000000000000ULL,
-	    10000000000000000000ULL
+		1ULL,
+		10ULL,
+		100ULL,
+		1000ULL,
+		10000ULL,
+		100000ULL,
+		1000000ULL,
+		10000000ULL,
+		100000000ULL,
+		1000000000ULL,
+		10000000000ULL,
+		100000000000ULL,
+		1000000000000ULL,
+		10000000000000ULL,
+		100000000000000ULL,
+		1000000000000000ULL,
+		10000000000000000ULL,
+		100000000000000000ULL,
+		1000000000000000000ULL,
+		10000000000000000000ULL
 	};
 	
 	u64 nbytes = (sorting_number_bit_width+7)/8;
-
+	
 	// @todo temporary storage save point
 	void *swap_space = PushTempBuffer(u8, item_size);
 	
@@ -607,14 +706,14 @@ void radix_sort(void *items, u64 item_size, u64 item_count, u64 offset_to_sortin
 		// Sort elements in-place
 		for (u64 i = 0; i < item_count; i += 1) {
 			u8 *src_guy = (u8*)items+i*item_size;
-				
+			
 			u64 num = 0;
 			memcpy(&num, src_guy + offset_to_sorting_number, nbytes);
 			u64 digit = (num / POW10[pass]) % 10;
 			
 			for (u64 b = 0; b < 10; b += 1) {
 				if (digit == b) {
-				
+					
 					if (i >= starts[b] && i < ends[b]) {
 						// This guy is already in his stable sorted place.
 						next_free[b] += 1;
@@ -638,20 +737,151 @@ void radix_sort(void *items, u64 item_size, u64 item_count, u64 offset_to_sortin
 	}
 }
 
+typedef struct Stream_Mft_Context {
+	Volume_Database *vol;
+	Semaphore chunk_streamed_sem;
+	File_Handle f;
+	Record_Range* record_ranges;
+	u64 record_range_count;
+	u64 file_records_per_read;
+	u64 max_file_record_count;
+	// Ring buffer
+	u8 *buffer;
+	u64 buffered;
+	u64 buffer_next_read;
+	u64 *chunk_sizes;
+	
+} Stream_Mft_Context;
+s64 stream_mft_thread_proc(Thread *t) {
+	tm_scope("Stream MFT Thread") {
+		Stream_Mft_Context *ctx = (Stream_Mft_Context*)t->userdata;
+		
+		File_Handle f = ctx->f;
+		Volume_Database *vol = ctx->vol;
+		
+		u64 buffer_next_place = 0;
+		
+		u64 buffer_size = ctx->max_file_record_count*vol->record_size;
+		
+		{
+			u64 ps = sys_get_info().page_size;
+			u64 page_count = (buffer_size + ps - 1) / ps;
+			ctx->buffer = (u8*)sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
+		}
+		
+		// @speed @memory reserve
+		persistent_array_init((void**)&ctx->chunk_sizes, sizeof(u64));
+		
+		for (u64 i = 0; i < ctx->record_range_count; i += 1) {
+			Record_Range range = ctx->record_ranges[i];
+			
+			LARGE_INTEGER new_pointer, mv;
+			mv.QuadPart = (LONGLONG)(range.first_record_index*vol->record_size);
+			SetFilePointerEx(f, mv, &new_pointer, 0/*FILE_BEGIN*/);
+			
+			for (u64 j = 0; j < range.record_count; j += ctx->file_records_per_read) tm_scope("Read Some") {
+				
+				u64 file_records_to_read = min(ctx->file_records_per_read, range.record_count-j);
+				u64 bytes_to_read = file_records_to_read*vol->record_size;
+				
+				// @todo @bug
+				while (ctx->buffered + bytes_to_read >= buffer_size) {
+					Sleep(1);
+				}
+				
+				u8 *dst = ctx->buffer + (buffer_next_place % buffer_size);
+				DWORD read = 0;
+				BOOL ok = 0;
+				tm_scope("ReadFile")
+					ok = ReadFile(f, dst, (DWORD)bytes_to_read, &read, 0);
+				
+				DWORD err = GetLastError();
+				assertmsgs(ok, tprint("%u", err));
+				assert(read == bytes_to_read);
+				
+				buffer_next_place += bytes_to_read;
+				sys_atomic_add_64(&ctx->buffered, bytes_to_read);
+				
+				persistent_array_push_copy(ctx->chunk_sizes, &bytes_to_read);
+				
+				sys_semaphore_signal(&ctx->chunk_streamed_sem);
+			}
+		}
+	}
+	return 0;
+}
+
 typedef struct Attribute_Processing_Context {
-	Resolve_Weird_Alias_Job *resolve_jobs;
-	string weird_alias_thing;
-	u64 readback_next_position;
-	u64 records_bytes_queued;
-	u64 max_readback_memory;
-	u8 *records_buffer;
-	File_Record *rec;
+	Stream_Mft_Context *stream_ctx;
+	u64 file_record_index;
+	struct Scattered_Attribute *scattered_attributes; // Persistent array
+	u64 sequence_number;
 	bool has_name;
-	bool has_had_weird_alias_thing;
 } Attribute_Processing_Context;
 
-bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, Attribute_Header_Base *attr_header_base, Entry *next_entry) {
+typedef struct Scattered_Attribute {
+	Entry *entry;
+	u64 file_record_index;
+	Attribute_Processing_Context *ctx;
+	Attribute_Type type;
+	u16 attribute_id;
+} Scattered_Attribute;
 
+void finalize_entry(Volume_Database *vol, Attribute_Processing_Context *ctx, Entry *next_entry) {
+	if (!next_entry->valid) return;
+	
+	//if (!(rec->flags & FILE_FLAGS_Compressed) && !(rec->flags & FILE_FLAGS_Encrypted)) {
+		if (!next_entry->is_directory && !string_starts_with(next_entry->name, STR("$")) && ctx->has_name) {
+			if (!next_entry->data) {
+				vol->dataless_count += 1;
+				//next_entry->valid = false;
+			}
+		}
+		
+		next_entry->ready = true;
+	//}
+	
+	if (!next_entry->valid) return;
+	
+	//if ((rec->flags & FILE_FLAGS_Compressed) || (rec->flags & FILE_FLAGS_Encrypted)) {
+	//	vol->compressed_count += 1;
+	//	next_entry->valid = false; // @todo
+	//}
+	if (!ctx->has_name) {
+		vol->unnamed_count += 1;
+		next_entry->valid = false; // @todo
+	} else assert(next_entry->name.count > 0 && next_entry->name.data != 0);
+}
+
+bool apply_fixups(File_Record *rec, Volume_Database *vol) {
+	u16 *usa = (u16 *)((u8 *)rec + rec->offset_to_update_sequence);
+	u16  usn = usa[0];
+	u16  usa_count = rec->size_in_words_of_update_sequence;
+	
+	if (usa_count != vol->record_size / vol->boot.bytes_per_sector + 1) {
+		vol->corrupt_usn_count += 1;
+		return false;
+	}
+	
+	bool err = false;
+	for (u16 k = 1; k < usa_count; ++k) {
+		u8 *sector_end = (u8 *)rec + k * vol->boot.bytes_per_sector - 2;
+		
+		if (*(u16 *)sector_end != usn) {
+			vol->corrupt_usn_count += 1;
+			err = true;
+			break;
+		}
+		
+		*(u16 *)sector_end = usa[k];
+	}
+	if (err) return false;
+	
+	return true;
+}
+
+bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, Attribute_Header_Base *attr_header_base, Entry *next_entry) {
+	
 	bool attr_named = attr_header_base->name_length > 0;
 	bool resident = attr_header_base->non_resident == 0;
 	
@@ -662,36 +892,37 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 		
 		File_Name *attr = (File_Name *)(attr_header->attr_and_maybe_name);
 		
-		string name = string_allocate(arena_allocator(&vol->entry_data_arena), attr->file_name_length*3+1);
+		u64 name_length = attr->file_name_length*3+1;
 		
+		string name = string_allocate(arena_allocator(&vol->entry_names_arena), name_length);
 		name.count = (u64)WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)attr->name, (int)attr->file_name_length, (char*)name.data, (int)name.count, 0, 0);
 		
-		//if (strings_match(STR("Software"), name)) __debugbreak();
+		if (string_starts_with(name, STR("$"))) {
+			next_entry->valid = false;
+			return false;
+		}
 		
-		bool is_weird_alias_thing = string_ends_with(name, STR("~1"));
-		if (!is_weird_alias_thing || !ctx->has_name) {
-			next_entry->name = name;
+		if ((string_find_index_from_left(name, STR("~1")) == -1 || !ctx->has_name) && name.count > 0) {
+			ctx->has_name = true;
+			
+			//u64 wasted = name_length - name.count;
+			//arena_pop(&vol->entry_names_arena, wasted);
 			
 			if (attr->parent_file_reference != 0) {
-				u64 parent_index = attr->parent_file_reference & 0x0000ffffffffffff;
-				next_entry->pointer_to_parent_entry = vol->entries_per_record + parent_index;
+				u64 parent_index = attr->parent_file_reference & 0x0000ffffffffffffULL;
+				assert(parent_index < vol->entry_count);
+				next_entry->parent = vol->entries + parent_index;
+				
 			} else {
 				next_entry->valid = false;
 			}
 			
-			ctx->has_name = true;
+			next_entry->name = name;
+			assert(next_entry->name.count > 0 && next_entry->name.data != 0);
 			
-			if (ctx->has_had_weird_alias_thing) {
-				Resolve_Weird_Alias_Job *job = (Resolve_Weird_Alias_Job*)persistent_array_push_empty(ctx->resolve_jobs);
-				*job = (Resolve_Weird_Alias_Job){0};
-				job->name = ctx->weird_alias_thing;
-				job->alias_entry = next_entry;
-			}
-		}
-		
-		if (is_weird_alias_thing) {
-			ctx->weird_alias_thing = name;
-			ctx->has_had_weird_alias_thing = true;
+			next_entry->size = attr->real_size;
+		} else {
+			//arena_pop(&vol->entry_names_arena, name_length);
 		}
 		
 		if (strings_match(name, STR("."))) {
@@ -699,21 +930,94 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 		}
 		
 		
-	} else if (attr_header_base->type == ATTR_DATA && !next_entry->is_directory && !attr_named) {
+	} else if (attr_header_base->type == ATTR_DATA && !next_entry->is_directory && !attr_named && next_entry->valid) {
 		next_entry->resident = resident;
-		
 		if (resident) {
 			Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
-			next_entry->size = attr_header->attribute_length;
-			void *attrib_data = (u8*)attr_header + attr_header->attribute_offset;
-			next_entry->data = arena_push_copy(&vol->entry_data_arena, attrib_data, next_entry->size);
+			if (attr_header->attribute_length > 0 && attr_header->attribute_length != next_entry->size) {
+				if (!next_entry->size) next_entry->size = attr_header->attribute_length;
+				void *attrib_data = (u8*)attr_header + attr_header->attribute_offset;
+				next_entry->data = arena_push_copy(&vol->entry_small_data_arena, attrib_data, next_entry->size);
+			}
 		} else {
 			Attribute_Header_Non_Resident *attr_header = (Attribute_Header_Non_Resident *)attr_header_base;
-			u64 data_run_size = ((u64)attr_header->base.length_including_header - (u64)attr_header->offset_to_data_runs);
-			next_entry->size = attr_header->attribute_real_size;
-			void *attrib_data = (u8*)attr_header + attr_header->offset_to_data_runs;
-			next_entry->data = arena_push_copy(&vol->entry_data_arena, attrib_data, data_run_size);
+			if (attr_header->attribute_real_size > 0) {
+				u64 data_run_size = ((u64)attr_header->base.length_including_header - (u64)attr_header->offset_to_data_runs);
+				if (!next_entry->data) {
+					if (!next_entry->size) next_entry->size = attr_header->attribute_real_size;
+					void *attrib_data = (u8*)attr_header + attr_header->offset_to_data_runs;
+					next_entry->data = arena_push_copy(&vol->entry_data_runs_arena, attrib_data, data_run_size);
+				}
+			}
 		}
+	}
+	
+	
+	if (attr_header_base->type == ATTR_REPARSE_POINT) tm_scope("Reparse Point") {
+		if (resident) {
+			
+			assert(!attr_named);
+			
+			Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
+			
+			Reparse_Point *attr = (Reparse_Point *)attr_header->attr_and_maybe_name;
+			
+			if ((attr->flags & REPARSE_Is_Microsoft) == REPARSE_Is_Microsoft) {
+				
+				REPARSE_DATA_BUFFER *data = (REPARSE_DATA_BUFFER *)attr->data_and_maybe_third_party_guid;
+				
+				u16 *path_base = 0;
+				
+				if (attr->flags == (u32)IO_REPARSE_TAG_MOUNT_POINT) {
+					path_base = data->DUMMYUNIONNAME.MountPointReparseBuffer.PathBuffer;
+				} else if (attr->flags == (u32)IO_REPARSE_TAG_SYMLINK) {
+					path_base = data->DUMMYUNIONNAME.SymbolicLinkReparseBuffer.PathBuffer;
+				}
+				
+				if (path_base) {
+					//u64 substitute_name_offset = data->DUMMYUNIONNAME.MountPointReparseBuffer.SubstituteNameOffset;
+					//u64 substitute_byte_length = data->DUMMYUNIONNAME.MountPointReparseBuffer.SubstituteNameLength;
+					//u64 print_name_offset      = data->DUMMYUNIONNAME.MountPointReparseBuffer.PrintNameOffset;
+					//u64 print_byte_length = data->DUMMYUNIONNAME.MountPointReparseBuffer.PrintNameLength;
+					
+					u16 *wide_substitute_path = path_base;
+					
+					File_Handle subf = 0;
+					tm_scope("CreateFileW")
+					subf = CreateFileW(
+						wide_substitute_path,
+						GENERIC_READ,
+						FILE_SHARE_READ | FILE_SHARE_DELETE,
+						0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0
+					);
+					
+					if (subf == (void*)0xFFFFFFFFFFFFFFFF) {
+						next_entry->valid = false;
+						return false;
+					}
+					
+					BY_HANDLE_FILE_INFORMATION info = (BY_HANDLE_FILE_INFORMATION){0};
+					BOOL ok = GetFileInformationByHandle(subf, &info);
+					assert(ok);
+					
+					u64 frn = ((u64)info.nFileIndexHigh << 32ULL) | info.nFileIndexLow;
+					
+					CloseHandle(subf);
+					
+					u64 file_record_index = frn & 0x0000FFFFFFFFFFFFULL;
+					
+					Entry *link_to = vol->entries + file_record_index;
+					
+					next_entry->is_symlink = true;
+					next_entry->first_child = link_to;
+				}
+				
+			}
+			
+				//if (strings_match(STR("SDF"), next_entry->name))
+				//	__debugbreak();
+			
+		} else print("Unhandled: Non-resident reparse point.\n");
 	}
 	
 	// This attribute is not like other attributes so it will break stuff
@@ -722,64 +1026,111 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 		return false; // break attribute looping
 	}
 	
-	if (attr_header_base->type == ATTR_ATTRIBUTE_LIST) {
+	if (attr_header_base->type == ATTR_ATTRIBUTE_LIST) tm_scope("Handle ATTRIBUTE_LIST") {
 		if (attr_named) print("Unhandled: named attribute list\n");
 		else {
 			if (resident) {
-				Attribute_Header_Resident *attr_header 
+				Attribute_Header_Resident *attr_header
 					= (Attribute_Header_Resident *)attr_header_base;
-				Attribute_List_Record *item 
+				Attribute_List_Record *item
 					= (Attribute_List_Record*)attr_header->attr_and_maybe_name;
 				
 				while ((u8*)item < (u8*)attr_header+attr_header_base->length_including_header) {
-					u64 frn = item->base_file_reference_of_attribute;
+					u64 ext_frn = item->base_file_reference_of_attribute;
 					
-					u64 file_record_index = frn & 0x0000ffffffffffff;
-					//__debugbreak();
-					//u64 expected_sequence_number = (frn & 0xFFFF) >> 48;
+					u64 ext_file_record_index = ext_frn & 0x0000ffffffffffffULL;
+					u64 expected_sequence_number = ext_frn >> 48ULL;
 					
-					u64 alive_end = ctx->readback_next_position*BYTES_PER_READBACK;
-					u64 alive_start 
-						= ctx->records_bytes_queued >= max_streaming_memory
-						? ctx->records_bytes_queued - max_streaming_memory
+					u64 stream_buffer_size = ctx->stream_ctx->max_file_record_count * vol->record_size;
+					
+					u64 alive_end = ctx->stream_ctx->buffer_next_read;
+					u64 alive_start
+						= ctx->stream_ctx->buffer_next_read >= stream_buffer_size
+						? ctx->stream_ctx->buffer_next_read - stream_buffer_size
 						: 0;
 					assert(alive_end > alive_start);
 					
-					u64 byte_index = file_record_index*vol->record_size;
+					u64 byte_index = ext_file_record_index*vol->record_size;
 					
 					if (byte_index >= alive_start && byte_index < alive_end) {
 						// This is in memory, we can handle it now
 						
-						File_Record *other_rec 
-							= (File_Record*)(ctx->records_buffer + (byte_index%ctx->max_readback_memory));
-						Attribute_Header_Base *other_attr_header 
-							= (Attribute_Header_Base *)((u8*)other_rec + other_rec->first_attribute_offset);
-						
-						while ((u64)other_attr_header < (u64)other_rec + other_rec->file_record_real_size && *(u32*)other_attr_header != 0xFFFFFFFF) {
+						File_Record *ext_rec
+							= (File_Record*)(ctx->stream_ctx->buffer + (byte_index%stream_buffer_size));
+						Attribute_Header_Base *ext_attr_header
+							= (Attribute_Header_Base *)((u8*)ext_rec + ext_rec->first_attribute_offset);
 							
-							if (other_attr_header != attr_header_base && other_rec != ctx->rec) {
-								if (!process_attribute(ctx, vol, other_attr_header, next_entry))
+						assert(strings_match((string){4, ext_rec->magic}, STR("FILE"))); // @todo err
+						
+						if (ext_file_record_index != ctx->file_record_index) {
+						
+							Entry *ext_entry = vol->entries + ext_file_record_index;
+							
+							if (!ext_entry->usa_applied) {
+								if (!apply_fixups(ext_rec, vol)) {
 									break;
+								}
+								
+								ext_entry->usa_applied = true;
 							}
 							
+							assert(ext_rec->mft_record_number == ext_file_record_index);
 							
-							other_attr_header = (Attribute_Header_Base*)((u8*)other_attr_header + other_attr_header->length_including_header);
+							
+							if (ext_rec->sequence_number == expected_sequence_number) {
+								assert(!ext_entry->valid);
+								while ((u64)ext_attr_header < (u64)ext_rec + ext_rec->file_record_real_size && *(u32*)ext_attr_header != 0xFFFFFFFF) {
+									
+									if (ext_attr_header != attr_header_base && ext_attr_header->type == item->type && ext_attr_header->attribute_id == item->attribute_id) {
+										if (!process_attribute(ctx, vol, ext_attr_header, next_entry)) {
+											break;
+										}
+										ext_attr_header->type = ATTR_HANDLED;
+									}
+									
+									
+									ext_attr_header = (Attribute_Header_Base*)((u8*)ext_attr_header + ext_attr_header->length_including_header);
+								}
+							} else {
+								static int n = 0;
+								print("Outdated attribute list file record (%u)\n", n);
+								n += 1;
+							}
+							
 						}
 						
+						
 					} else {
-						static u64 n = 0;
-						print("Unhandled: Attribute list record not in memory (%u, %u)\n", n, file_record_index);
-						n += 1;
-						break;
+						if (byte_index < alive_start) {
+							static u64 n = 0;
+							print("Unhandled: Attribute list record not in memory (Evicted) (%u, %u)\n", n, ext_file_record_index);
+							n += 1;
+						} else {
+							// Attribute list not in memory, postpone it until it is in memory.
+							
+							// We only care about these for now
+							if (item->type == ATTR_FILE_NAME || item->type == ATTR_DATA || item->type == ATTR_REPARSE_POINT) {
+								Scattered_Attribute *s 
+									= (Scattered_Attribute *)persistent_array_push_empty(ctx->scattered_attributes);
+								*s = (Scattered_Attribute){0};
+								s->entry = next_entry;
+								s->file_record_index = ext_file_record_index;
+								s->ctx = ctx;
+								s->type = item->type;
+								s->attribute_id = item->attribute_id;
+							}
+						}
 					}
 					
 					item = (Attribute_List_Record*)((u8*)item + item->record_length);
 				}
 				
 			} else {
+				// @todo
 				static u64 n = 0;
 				print("Unhandled: non-resident attribute list (%u)\n", n);
 				n += 1;
+				return false;
 			}
 		}
 	}
@@ -806,28 +1157,26 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 	u16 _cpath[MAX_PATH_LENGTH*2];
 	u16 *cpath = _cpath;
 	_win_utf8_to_wide(vol_file_name, cpath, MAX_PATH_LENGTH*2);
+	DWORD flags = 0;
+#ifdef NO_CACHE
+	flags |= FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING;
+#endif
 	File_Handle f = CreateFileW(
 		cpath, GENERIC_READ,
 		FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-		0, OPEN_EXISTING, 0, 0
+		0, OPEN_EXISTING, flags, 0
 	);
-	File_Handle fasync = CreateFileW(
-		cpath, GENERIC_READ,
-		FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-		0, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0
-	);
-	
 	if (f == (File_Handle)0xffffffffffffffff) {
 		print("Could not open volume for reading.\n");
 		return false;
 	}
-	if (fasync == (File_Handle)0xffffffffffffffff) {
-		print("Could not open volume for async reading.\n");
-		return false;
-	}
 	
 	// @leak
-	vol->entry_data_arena = make_arena(GiB(16), MiB(1));
+	vol->entry_names_arena = make_arena(GiB(16), MiB(10));
+	vol->entry_small_data_arena = make_arena(GiB(16), MiB(10));
+	vol->entry_data_runs_arena = make_arena(GiB(16), MiB(10));
+	
+	vol->scratch = make_arena(GiB(16), MiB(300));
 	
 	BYTE sector[512];
 	DWORD read = 0;
@@ -854,33 +1203,31 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 	LARGE_INTEGER mv;
 	mv.QuadPart = (LONGLONG)mft_offset;
 	LARGE_INTEGER new_pointer;
+	tm_scope("SetFilePointerEx")
 	SetFilePointerEx(f, mv, &new_pointer, 0/*FILE_BEGIN*/);
 	
-	Resolve_Weird_Alias_Job *resolve_jobs;
-	// @leak
-	persistent_array_init((void**)&resolve_jobs, sizeof(Resolve_Weird_Alias_Job));
-	
-	u8* file_record_buffer = PushTempBuffer(u8, record_size+boot->bytes_per_sector);
+	u8* file_record_buffer = 0;
+	file_record_buffer = PushTempBuffer(u8, record_size+boot->bytes_per_sector);
 	file_record_buffer = (u8*)(uintptr)align_next((u64)file_record_buffer, boot->bytes_per_sector);
 	
 	// Read first file record
-	tm_scope("ReadFile first record")
-	ReadFile(f, file_record_buffer, (DWORD)record_size, &read, 0);
-	File_Record *rec = (File_Record*)file_record_buffer;
-	strings_match((string){4, rec->magic}, STR("FILE"));
+	tm_scope("Read first file record")
+		ReadFile(f, file_record_buffer, (DWORD)record_size, &read, 0);
+	File_Record *first_rec = (File_Record*)file_record_buffer;
+	strings_match((string){4, first_rec->magic}, STR("FILE"));
 	
 	Record_Range record_ranges[1024] = {0};
 	u64 record_range_count = 0;
 	u64 total_record_count = 0;
 	
-	{
+	tm_scope("Find MFT Record Ranges") {
 		///
 		// Assume first file record is $MFT and find all file record ranges
 		
 		File_Name *file_name_attrib = 0;
 		Attribute_Header_Non_Resident *data_attrib = 0;
 		
-		Attribute_Header_Base *attr_base = (Attribute_Header_Base *)((u8*)rec + rec->first_attribute_offset);
+		Attribute_Header_Base *attr_base = (Attribute_Header_Base *)((u8*)first_rec + first_rec->first_attribute_offset);
 		while (*(u32*)attr_base != 0xFFFFFFFF) {
 			
 			if (attr_base->type == ATTR_FILE_NAME)
@@ -955,239 +1302,221 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 	//////////////////////
 	//// Allocate a) records readback buffer (transient), and b) the memory to hold our indexed entries etc.
 	
-	u64 max_readback_memory = max(max_streaming_memory, BYTES_PER_READBACK);
-	u64 max_readback_count = max_readback_memory/BYTES_PER_READBACK;
-	
 	u64 ps = sys_get_info().page_size;
-	
-	u8 *records_buffer = 0;
-	{
-		u64 page_count = (max_readback_memory + ps + 1) / ps;
-		records_buffer = (u8*)sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
-	}
 	
 	vol->entry_count = total_record_count;
 	u64 entries_size = vol->entry_count*sizeof(Entry);
-	u64 entries_per_record_size = vol->entry_count*sizeof(Entry*);
-	u64 entries_mem_size = align_next(entries_size, 8) + entries_per_record_size;
+	u64 entries_mem_size = align_next(entries_size, 8);
 	{
 		u64 page_count  = (entries_mem_size + ps + 1) / ps;
-		u8 *entries_mem = (u8*)sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
 		// @leak
+		u8 *entries_mem = (u8*)sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
 		vol->entries = (Entry*)entries_mem;
-		vol->entries_per_record = (Entry**)(uintptr)align_next((u64)(entries_mem + sizeof(Entry)*vol->entry_count), 8);
 		memset(vol->entries, 0, entries_mem_size);
 	}
 	
 	////////////
 	/// Walk file records. Read future file records from disk asynchronously.
 	
-	OVERLAPPED *ovl_buffer = PushTempBuffer(OVERLAPPED, max_readback_count);
-	HANDLE *events = PushTempBuffer(HANDLE, max_readback_count);
-	u64 *read_sizes = PushTempBuffer(u64, max_readback_count);
-	memset(ovl_buffer, 0, sizeof(OVERLAPPED)*max_readback_count);
-	memset(events, 0, sizeof(HANDLE)*max_readback_count);
-	memset(read_sizes, 0, sizeof(u64)*max_readback_count);
-	u64 readback_count = 0;
-	u64 readback_place_position = 0;
-	u64 readback_next_position = 0;
 	
-	for (u64 i = 0; i < max_readback_count; i += 1) {
-		events[i] = CreateEventA(0, 1, 0, 0);
-	}
+	Scattered_Attribute *scattered_attributes;
+	persistent_array_init((void**)&scattered_attributes, sizeof(Scattered_Attribute));
 	
-	u64 processed_record_count = 0;
+	Attribute_Processing_Context *attribute_contexts;
+	persistent_array_init((void**)&attribute_contexts, sizeof(Attribute_Processing_Context));
 	
-	for (u64 i = 0; i < record_range_count; i += 1) tm_scope("Record Range") {
-		Record_Range range = record_ranges[i];
+	Stream_Mft_Context stream_ctx = (Stream_Mft_Context){0};
+	
+	stream_ctx.vol = vol;
+	stream_ctx.f = f;
+	sys_semaphore_init(&stream_ctx.chunk_streamed_sem);
+	stream_ctx.record_ranges = record_ranges;
+	stream_ctx.record_range_count = record_range_count;
+	stream_ctx.file_records_per_read = BYTES_PER_READBACK/record_size;
+	u64 chunk_count = max_streaming_memory/(stream_ctx.file_records_per_read*record_size);
+	stream_ctx.max_file_record_count = chunk_count * stream_ctx.file_records_per_read;
+	
+	Thread stream_thread;
+	sys_thread_init(&stream_thread, stream_mft_thread_proc, &stream_ctx);
+	sys_thread_start(&stream_thread);
+	
+	u64 stream_buffer_size = stream_ctx.max_file_record_count * record_size;
+	
+	u64 total_processed_count = 0;
+	
+	u64 chunk_index = 0;
+	
+	tm_scope("Process streamed chunks")
+	while (total_processed_count < vol->entry_count) tm_scope("Process one chunk") {
 		
-		mv.QuadPart = (LONGLONG)(range.first_record_index*record_size);
-		SetFilePointerEx(f, mv, &new_pointer, 0/*FILE_BEGIN*/);
+		tm_scope("Wait chunk streamed")
+		sys_semaphore_wait(stream_ctx.chunk_streamed_sem);
 		
-		u64 records_bytes_read = 0;
-		u64 records_bytes_queued = 0;
+		u8 *chunk = stream_ctx.buffer + (stream_ctx.buffer_next_read % stream_buffer_size);
 		
-		while (records_bytes_read < range.record_count*record_size) tm_scope("Record Range step") {
+		u64 chunk_size = stream_ctx.chunk_sizes[chunk_index];
+		assert(chunk_size % record_size == 0);
+		u64 streamed_count = chunk_size/record_size;
+		
+		stream_ctx.buffer_next_read += chunk_size;
+		
+		
+		/////
+		// On receiving new chunk, check if any scattered attributes happened to be loaded in
+		tm_scope("Check scattered attributes") {
+			u64 file_index_a = total_processed_count;
+			u64 file_index_b = file_index_a + streamed_count;
 			
-			u8 *readback_data = 0; (void)readback_data;
-			
-			/////
-			// Queue a maximum of 'max_queues_per_iter' future reads
-			// (Doing them all up front is slower for some reason ?)
-			
-			u64 max_queues_per_iter = 3;
-			u64 queued_this_iter = 0;
-			
-			while (records_bytes_queued < range.record_count*record_size && queued_this_iter < max_queues_per_iter) tm_scope("Queue read") {
+			for (u64 i = 0; i < persistent_array_count(scattered_attributes); i += 1) {
+				Scattered_Attribute *s = scattered_attributes + i;
+				Entry *next_entry = s->entry;
 				
-				if (readback_count >= max_readback_count) {
-					break;
-				}
+				u64 count = persistent_array_count(scattered_attributes);
 				
-				u64 remainder = (range.record_count*record_size) - records_bytes_queued;
-				u64 to_read_async = (DWORD)min(remainder, BYTES_PER_READBACK);
-				
-				if (to_read_async) tm_scope("Queue next ReadFile") {
-					u8 *target_data = records_buffer + (readback_place_position%max_readback_count)*BYTES_PER_READBACK;
+				if (s->file_record_index >= file_index_a && s->file_record_index < file_index_b) {
+					File_Record *ext_rec = (File_Record*)(chunk + (s->file_record_index - file_index_a)*record_size);
 					
-					OVERLAPPED *ovl = ovl_buffer + (readback_place_position % max_readback_count);
-					*ovl = (OVERLAPPED){0};
-					u64 byte_offset = range.first_record_index*record_size + records_bytes_queued;
-					ovl->Offset = byte_offset & 0xFFFFFFFF;
-					ovl->OffsetHigh = byte_offset >> 32;
-					ovl->hEvent = events[(readback_place_position % max_readback_count)];
-					ResetEvent(events[(readback_place_position % max_readback_count)]);
-					tm_scope("Async ReadFile call")
-					ReadFile(fasync, target_data, (DWORD)to_read_async, 0, ovl);
-					vol->bytes_read += to_read_async;
+					Entry *ext_entry = vol->entries + s->file_record_index;
 					
-					read_sizes[(readback_place_position % max_readback_count)] = to_read_async;
-					
-					sys_atomic_add_64(&readback_count, 1);
-					readback_place_position += 1;
-					
-					records_bytes_queued += to_read_async;
-					
-					queued_this_iter += 1;
-					
-				} else continue;
-			}
-			
-			if (records_bytes_read >= range.record_count*record_size) break;
-			
-			
-			/////
-			// Wait for next async read to finish
-			
-			// @cleanup
-			//u64 record_offset = 0;
-			
-			tm_scope("Wait Last ReadFile") {
-				OVERLAPPED *ovl = ovl_buffer + (readback_next_position % max_readback_count);
-				
-				DWORD async_read = 0;
-				f64 io0 = sys_get_seconds_monotonic();
-				BOOL ok = GetOverlappedResult(fasync, ovl, &async_read, true);
-				f64 io1 = sys_get_seconds_monotonic();
-				vol->waiting_for_io_time += io1-io0;
-				assert(ok);
-				assert(read_sizes[(readback_next_position % max_readback_count)] == async_read);
-				
-				readback_data = records_buffer + (readback_next_position%max_readback_count)*BYTES_PER_READBACK;
-				
-				readback_next_position += 1;
-				assert(readback_count > 0);
-				sys_atomic_add_64(&readback_count, (u64)-1);
-				
-				// @cleanup
-				//record_offset = (u64)ovl->Offset | ((u64)ovl->OffsetHigh << 32);
-				
-				records_bytes_read += async_read;
-				
-				read = async_read;
-			}
-			
-			/////
-			// Process the records that were fetched
-			
-			u64 to_process = read/record_size;
-			
-			tm_scope("Process streamed records")
-			for (u64 j = 0; j < to_process; j += 1) {
-				
-				Attribute_Processing_Context ctx = (Attribute_Processing_Context){0};
-				ctx.resolve_jobs = resolve_jobs;
-				ctx.readback_next_position = readback_next_position;
-				ctx.records_bytes_queued = records_bytes_queued;
-				ctx.max_readback_memory = max_readback_memory;
-				ctx.records_buffer = records_buffer;
-				ctx.rec = rec;
-				
-				Entry *next_entry = vol->entries + (processed_record_count + j);
-				next_entry->valid = true;
-				
-				rec = (File_Record*)(readback_data + record_size*(j));
-				{
-					/////
-					// Apply ntfs fixups
-					
-					u16  *usa = (u16 *)((u8 *)rec + rec->offset_to_update_sequence);
-					u16   usn = usa[0];
-					u16   usa_count = rec->size_in_words_of_update_sequence;
-					
-					if (usa_count != record_size / boot->bytes_per_sector + 1) {
-						vol->corrupt_usn_count += 1;
-						next_entry->valid = false;
-						continue;
-					}
-					
-					for (u16 k = 1; k < usa_count; ++k) {
-						u8 *sector_end = (u8 *)rec + k * boot->bytes_per_sector - 2;
-						
-						if (*(u16 *)sector_end != usn) {
-							vol->corrupt_usn_count += 1;
-							next_entry->valid = false;
+					if (!ext_entry->usa_applied) {
+						if (!apply_fixups(ext_rec, vol)) {
+							// Unordered remove
+							if (i < count-1) {
+								*s = scattered_attributes[count-1];
+								i -= 1;
+							}
+							persistent_array_set_count(scattered_attributes, (u64)(count-1));
+							
 							continue;
 						}
-						
-						*(u16 *)sector_end = usa[k];
+						ext_entry->usa_applied = true;
 					}
+					
+					assert(strings_match((string){4, ext_rec->magic}, STR("FILE"))); // @todo err
+					
+					next_entry->valid = true;
+					
+					Attribute_Header_Base *ext_attr_header
+						= (Attribute_Header_Base *)((u8*)ext_rec + ext_rec->first_attribute_offset);
+					
+					assert(ext_rec->mft_record_number == s->file_record_index);
+					
+					while ((u64)ext_attr_header < (u64)ext_rec + ext_rec->file_record_real_size && *(u32*)ext_attr_header != 0xFFFFFFFF) {
+						
+						if (ext_attr_header->type == s->type && ext_attr_header->attribute_id == s->attribute_id) {
+							if (!process_attribute(s->ctx, vol, ext_attr_header, next_entry)) {
+								break;
+							}
+							ext_attr_header->type = ATTR_HANDLED;
+						}
+						
+						ext_attr_header = (Attribute_Header_Base*)((u8*)ext_attr_header + ext_attr_header->length_including_header);
+					}
+					
+					finalize_entry(vol, s->ctx, next_entry);
+					
+					// Unordered remove
+					// @todo try to see if ordered remove makes things overall faster or slower
+					// (Scattered attributes might appear in order, so it might be overall faster
+					// to find the attributes we need if they are ordered).
+					if (i < count-1) {
+						*s = scattered_attributes[count-1];
+						i -= 1;
+					}
+					persistent_array_set_count(scattered_attributes, (u64)(count-1));
+					
 				}
 				
-				if (!strings_match((string){4, rec->magic}, STR("FILE"))) {
-					vol->file_record_hole_count += 1;
+			}
+		}
+		
+		tm_scope("Process records in chunk")
+		for (u64 i = 0; i < streamed_count; i += 1) {
+			File_Record *rec = (File_Record*)(chunk + record_size*i);
+			
+			
+			Attribute_Processing_Context *ctx = 
+				(Attribute_Processing_Context *)persistent_array_push_empty(attribute_contexts);
+			*ctx = (Attribute_Processing_Context){0};
+			
+			ctx->stream_ctx = &stream_ctx;
+			ctx->file_record_index = total_processed_count + i;
+			ctx->scattered_attributes = scattered_attributes;
+			ctx->sequence_number = rec->sequence_number;
+			
+			Entry *next_entry = vol->entries + (total_processed_count + i);
+			// Note: DO NOT ZERO HERE
+			assert(!next_entry->valid);
+			assert(next_entry->name.count == 0);
+			
+			// @copypaste
+			if (!next_entry->usa_applied) {
+				if (!apply_fixups(rec, vol)) {
 					continue;
 				}
 				
-				next_entry->is_directory = (rec->flags & FILE_RECORD_FLAGS_DIRECTORY) != 0;
-				Attribute_Header_Base *attr_header_base = (Attribute_Header_Base *)((u8*)rec + rec->first_attribute_offset);
-				
-				/////
-				// Walk attributes
-				
-				while ((u64)attr_header_base < (u64)rec + rec->file_record_real_size && *(u32*)attr_header_base != 0xFFFFFFFF) {
-					
-					if (!process_attribute(&ctx, vol, attr_header_base, next_entry))
-						break;
-					
-					attr_header_base = (Attribute_Header_Base*)((u8*)attr_header_base + attr_header_base->length_including_header);
-				}
-				
-				
-				if (!(rec->flags & FILE_FLAGS_Compressed) && !(rec->flags & FILE_FLAGS_Encrypted)) {
-					vol->entries_per_record[processed_record_count+j] = next_entry;
-					if (!next_entry->is_directory && !string_starts_with(next_entry->name, STR("$")) && ctx.has_name) {
-						if (!next_entry->data) {
-							vol->dataless_count += 1;
-						}
-					}
-					
-					next_entry->ready = true;
-				}
-				
-				if ((rec->flags & FILE_FLAGS_Compressed) || (rec->flags & FILE_FLAGS_Encrypted)) {
-					vol->compressed_count += 1;
-					next_entry->valid = false; // @todo
-				}
-				if (!ctx.has_name) {
-					vol->unnamed_count += 1;
-					next_entry->valid = false; // @todo
-				}
+				next_entry->usa_applied = true;
 			}
 			
-			processed_record_count += to_process;
+			// This is a dummy file record to hold ATTRIBUTE_LIST entries
+			// NOTE: This check must happen after usa fixups
+			if (rec->base_file_record_reference != 0) {
+				continue;
+			}
+			
+			if (!strings_match((string){4, rec->magic}, STR("FILE"))) {
+				vol->file_record_hole_count += 1;
+				continue;
+			}
+			
+			next_entry->valid = true;
+			
+			next_entry->is_directory = (rec->flags & FILE_RECORD_FLAGS_DIRECTORY) != 0;
+			Attribute_Header_Base *attr_header_base = (Attribute_Header_Base *)((u8*)rec + rec->first_attribute_offset);
+			
+			/////
+			// Walk attributes
+			
+			//tm_scope("Walk attributes")
+			while ((u64)attr_header_base < (u64)rec + rec->file_record_real_size && *(u32*)attr_header_base != 0xFFFFFFFF) {
+				
+				if (!process_attribute(ctx, vol, attr_header_base, next_entry)) {
+					break;
+				}
+					
+				attr_header_base->type = ATTR_HANDLED;
+				attr_header_base = (Attribute_Header_Base*)((u8*)attr_header_base + attr_header_base->length_including_header);
+			}
+			
+			
+			finalize_entry(vol, ctx, next_entry);
 		}
+		
+		total_processed_count += streamed_count;
+		
+		sys_atomic_add_64(&stream_ctx.buffered, -chunk_size);
+		
+		chunk_index += 1;
 	}
-
 	
-	/*timestamp_begin(STR("Resolve weird alias things"));
+	sys_thread_join(&stream_thread);
+	sys_thread_close(&stream_thread);
+	sys_semaphore_release(&stream_ctx.chunk_streamed_sem);
+	
+	sys_unmap_pages(stream_ctx.buffer);
+	persistent_array_uninit(stream_ctx.chunk_sizes);
+	
+	persistent_array_uninit(scattered_attributes);
+	persistent_array_uninit(attribute_contexts);
+	
 	for (u64 i = 0; i < vol->entry_count; i += 1) {
 		Entry *entry = vol->entries + i;
 		
-		//if (!entry->valid) continue;
-		if (!entry->pointer_to_parent_entry) continue;
+		if (!entry->valid) continue;
 		
-		Entry *p = *entry->pointer_to_parent_entry;
+		Entry *p = entry->parent;
+		
+		if (entry == p) continue; // ".", or other metafiles, etc
 		
 		if (!p->first_child) {
 			p->first_child = entry;
@@ -1196,43 +1525,42 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 			p->first_child = entry;
 		}
 	}
+	
 	for (u64 i = 0; i < vol->entry_count; i += 1) {
 		Entry *entry = vol->entries + i;
 		
-		//if (!entry->valid) continue;
-		if (!entry->pointer_to_parent_entry) continue;
+		if (!entry->valid) continue;
 		
-		Entry *p = *entry->pointer_to_parent_entry;
+		if (entry->is_symlink) {
+			string pretend_name = entry->name;
+			Entry *pretend_parent = entry->parent;
+			Entry *pretend_sibling = entry->next_sibling;
+			
+			Entry *link_to = entry->first_child;
+			
+			memcpy(entry, link_to, sizeof(Entry));
+			
+			entry->name = pretend_name;
+			entry->parent = pretend_parent;
+			entry->next_sibling = pretend_sibling;
+		}
 		
-		if (strings_match(p->name, STR("DOWNLO~1"))) {
-			//__debugbreak();
+		Entry *p = entry->parent;
+		
+		if (entry == p) continue; // ".", or other metafiles, etc
+		
+		// Sometimes there are weird duplicates of directory names.
+		// For now we work around this by ignoring empty directores
+		// (the duplicates seem to be empty)
+		// @todo @bug
+		if (entry->is_directory && !entry->first_child) {
+			entry->valid = false;
 		}
 	}
 	
-	for (u64 i = 0; i < persistent_array_count(resolve_jobs); i += 1) {
-		Resolve_Weird_Alias_Job *job = resolve_jobs + i;
-		
-		//if (strings_match(job->alias_entry->name, STR("Downloads"))) __debugbreak();
-		
-		Entry *next = (*job->alias_entry->pointer_to_parent_entry)->first_child;
-		
-		while (next) {
-			if (next != job->alias_entry && strings_match(next->name, job->name)) {
-				job->alias_entry->symlink = next;
-				__debugbreak();
-				break;
-			}
-			next = next->next_sibling;
-		}
-	}
-	timestamp_end(STR("Resolve weird alias things"));*/
+	free_arena(vol->scratch);
 	
-	if (!is_command_line) {
-		for (u64 k = 0; k < max_readback_count; k += 1) CloseHandle(events[k]);
-		sys_unmap_pages(records_buffer);
-		CloseHandle(f);
-		CloseHandle(fasync);
-	}
+	CloseHandle(f);
 	
 	vol->done = true;
 	return true;
@@ -1247,15 +1575,11 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 string tprint_entry_full_path(string volume_label, Entry *entry) {
 	string dirpath = STR("");
 	
-	if (entry->pointer_to_parent_entry) {
-		Entry *parent = *entry->pointer_to_parent_entry;
-		while (parent && parent != *parent->pointer_to_parent_entry && !strings_match(parent->name, STR("."))) {
-			dirpath = tprint("%s\\%s", parent->name, dirpath);
-			
-			if (parent->pointer_to_parent_entry) {
-				parent = *parent->pointer_to_parent_entry;
-			} else break;
-		}
+	Entry *parent = entry->parent;
+	while (parent && parent != parent->parent && !strings_match(parent->name, STR("."))) {
+		dirpath = tprint("%s\\%s", parent->name, dirpath);
+		
+		parent = parent->parent;
 	}
 	
 	dirpath = tprint("%s:\\%s", volume_label, dirpath);
@@ -1265,7 +1589,6 @@ string tprint_entry_full_path(string volume_label, Entry *entry) {
 
 typedef enum Task_Kind {
 	TASK_INDEX_VOLUME,
-	TASK_QUERY_VOLUME,
 } Task_Kind;
 
 typedef struct Task_Pipe {
@@ -1308,17 +1631,25 @@ Gui_State state = (Gui_State){0};
 
 int gui_loop(void);
 
-Entry *full_path_to_entry_directory(Volume_Database vol, string path) {
+Entry *full_path_to_entry_directory(Volume_Database vol, string absolute_path) {
 	timestamp_begin(STR("Find directory entry"));
 	
-	u64 slashes = string_count_occurences(path, STR("\\"));
+	if (absolute_path.count == 2 || absolute_path.count == 3) {
+		if (string_starts_with(vol.name, absolute_path) || string_starts_with(absolute_path, vol.name)) {
+			return vol.root_entry;
+		} else {
+			return 0;
+		}
+	}
+	
+	u64 slashes = string_count_occurences(absolute_path, STR("\\"));
 	Entry *path_entry = 0;
 	
 	if (slashes > 0) {
 		u64 search_dir_name_count = 0;
 		string *search_dir_names = PushTempBuffer(string, slashes+1);
 		
-		string next = path;
+		string next = absolute_path;
 		for (u64 i = 0; i < slashes; i += 1) {
 			s64 slash_index = string_find_index_from_right(next, STR("\\"));
 			search_dir_names[search_dir_name_count++] = string_slice(next, (u64)slash_index+1, next.count-(u64)slash_index-1);
@@ -1332,10 +1663,13 @@ Entry *full_path_to_entry_directory(Volume_Database vol, string path) {
 			
 			Entry *entry = &vol.entries[i];
 			
+			if (!entry->valid) continue;
 			if (!entry->is_directory) continue;
 			
 			Entry *next_dir = entry;
 			for (u64 j = 0; j < search_dir_name_count; j += 1) {
+				
+				if (!next_dir->valid) break;
 				
 				if (strings_match(next_dir->name, search_dir_names[j])) {
 					dir_match_count += 1;
@@ -1347,10 +1681,7 @@ Entry *full_path_to_entry_directory(Volume_Database vol, string path) {
 					break;
 				}
 				
-				if (!next_dir->pointer_to_parent_entry) {
-					break;
-				}
-				next_dir = *next_dir->pointer_to_parent_entry;
+				next_dir = next_dir->parent;
 			}
 			
 			if (dir_match_count == search_dir_name_count) {
@@ -1369,517 +1700,565 @@ Entry *full_path_to_entry_directory(Volume_Database vol, string path) {
 }
 
 s64 work_thread_proc(Thread *t) {
-	Work_Context *wctx = (Work_Context*)t->userdata;
-	Query_Context *ctx = wctx->ctx;
-	while (1) {
-		
-		sys_semaphore_wait(ctx->work_sem);
-		
-		u64 work_index = sys_atomic_add_64(&ctx->next_work_index, 1);
-		Work *work = ctx->work + work_index;
-		
-		if (work_index >= persistent_array_count(ctx->work)) {
-			break;
-		}
-		
-		assert(work->data);
-		assert(work->size);
-		
-		if (work->is_async) {
-			DWORD read = 0;
-			BOOL ok = GetOverlappedResult(work->f, &work->ovl, &read, TRUE);
-			DWORD err = GetLastError();
-			assertmsgs(ok, tprint("%u", err));
-			//assert(read == work->size);
-			CloseHandle(work->ovl.hEvent);
-		}
-		
-		//print("Read @ %u\n", work->data);
-		
-		u8 *p = work->data;
-		u8 *end = p + work->size;
-		
-		u8 *line_start = p;
-		
-		// @simd
-		while (p < end) {
-		
-			if (p > work->data && *(p-1) == '\n') {
-				line_start = p;
+	tm_scope("Worker thread") {
+		Work_Context *wctx = (Work_Context*)t->userdata;
+		Query_Context *ctx = wctx->ctx;
+		while (1) {
+			tm_scope("Wait for work")
+			sys_semaphore_wait(ctx->work_sem);
+			
+			u64 work_index = sys_atomic_add_64(&ctx->next_work_index, 1);
+			Work *work = ctx->work + work_index;
+			
+			if (work_index >= persistent_array_count(ctx->work)) {
+				break;
 			}
-		
-			for (u64 i = 0; i < ctx->search_term_count; i += 1) {
-				string term = ctx->search_terms[i];
+			
+			assert(work->data);
+			assert(work->size);
+			
+			
+			if (work->is_async) tm_scope("Wait for async ReadFile") {
+				DWORD read = 0;
+				BOOL ok = GetOverlappedResult(work->f, &work->ovl, &read, TRUE);
+				DWORD err = GetLastError();
+				assertmsgs(ok, tprint("%u", err));
+				//assert(read == work->size);
+				CloseHandle(work->ovl.hEvent);
+			}
+			
+			//print("Read @ %u\n", work->data);
+			
+			u8 *p = work->data;
+			u8 *end = p + work->size;
+			
+			u8 *line_start = p;
+			
+			// @simd
+			tm_scope("Search data chunk for match")
+			while (p < end) {
 				
-				if (p + term.count <= end) {
+				if (p > work->data && *(p-1) == '\n') {
+					line_start = p;
+				}
+				
+				for (u64 i = 0; i < ctx->search_term_count; i += 1) {
+					string term = ctx->search_terms[i];
 					
-					bool does_match = true;
-					for (u64 j = 0; j < term.count; j += 1) {
-						if (p[j] != term.data[j]) {
-							does_match = false;
-							break;
-						}
-					}
-					
-					if (does_match) {
-						Match match = (Match) {0};
-						match.entry = work->entry;
-						match.pos_in_line = (u64)(p - line_start);
+					if (p + term.count <= end) {
 						
-						u8 *line_end = p;
+						bool does_match = true;
 						
-						while (line_end < end && *line_end != '\n') {
-							line_end += 1;
+						for (u64 j = 0; j < term.count; j += 1) {
+							if (p[j] != term.data[j]) {
+								does_match = false;
+								break;
+							}
 						}
 						
-						string line_slice = STR("");
-						
-						if ((u64)(line_end-line_start) <= MAX_CONTEXT_PREVIEW_LINE_LENGTH) {
-							line_slice = (string) { (u64)(line_end-line_start), line_start };
-						} else if (term.count < MAX_CONTEXT_PREVIEW_LINE_LENGTH) {
-							u64 budget = MAX_CONTEXT_PREVIEW_LINE_LENGTH - term.count;
-							u64 left_budget = budget/2;
-							u64 right_budget = budget/2;
-							if (budget % 2 == 0) left_budget += 1;
+						if (does_match) tm_scope("Handle match") {
+							Match match = (Match) {0};
+							match.entry = work->entry;
+							match.pos_in_line = (u64)(p - line_start);
 							
-							u8 *left = max((p-left_budget), line_start);
-							right_budget += (u64)left - (u64)(p-left_budget);
-							u8 *right = min((p+right_budget), line_end);
-							left_budget += (u64)(p+right_budget) - (u64)right;
+							u8 *line_end = p;
 							
-							left  = max((p-left_budget), line_start);
-							right = min((p+right_budget), line_end);
+							while (line_end < end && *line_end != '\n') {
+								line_end += 1;
+							}
 							
-							line_slice = (string) { (u64)(right-left), left };
+							string line_slice = STR("");
 							
-						} else {
-							line_slice = string_slice(term, 0, MAX_CONTEXT_PREVIEW_LINE_LENGTH);
+							if ((u64)(line_end-line_start) <= MAX_CONTEXT_PREVIEW_LINE_LENGTH) {
+								line_slice = (string) { (u64)(line_end-line_start), line_start };
+							} else if (term.count < MAX_CONTEXT_PREVIEW_LINE_LENGTH) {
+								u64 budget = MAX_CONTEXT_PREVIEW_LINE_LENGTH - term.count;
+								u64 left_budget = budget/2;
+								u64 right_budget = budget/2;
+								if (budget % 2 == 0) left_budget += 1;
+								
+								u8 *left = max((p-left_budget), line_start);
+								right_budget += (u64)left - (u64)(p-left_budget);
+								u8 *right = min((p+right_budget), line_end);
+								left_budget += (u64)(p+right_budget) - (u64)right;
+								
+								left  = max((p-left_budget), line_start);
+								right = min((p+right_budget), line_end);
+								
+								line_slice = (string) { (u64)(right-left), left };
+								
+							} else {
+								line_slice = string_slice(term, 0, MAX_CONTEXT_PREVIEW_LINE_LENGTH);
+							}
+							
+							
+							match.line.count = line_slice.count;
+							
+							// @speed this mutex might noticably affect responsiveness if there are
+							// a lot of matches.
+							sys_mutex_acquire(ctx->match_mutex);
+							match.line.data = (u8*)arena_push_string(&ctx->match_strings_arena, line_slice);
+							persistent_array_push_copy(ctx->query->matches, &match);
+							u64 c = sys_atomic_add_64(work->pointer_to_match_count_for_entry, 1);
+							if (c == 0) sys_atomic_add_64(&ctx->query->unique_files_with_any_match_count, 1);
+							sys_mutex_release(ctx->match_mutex);
 						}
-						
-						
-						match.line.count = line_slice.count;
-						
-						// @speed this mutex might noticably affect responsiveness if there are
-						// a lot of matches.
-						sys_mutex_acquire(ctx->match_mutex);
-						match.line.data = (u8*)arena_push_string(&ctx->match_strings_arena, line_slice);
-						persistent_array_push_copy(ctx->query->matches, &match);
-						sys_mutex_release(ctx->match_mutex);
 					}
 				}
+				p += 1;
 			}
-			p += 1;
+			
+			work->entry->was_searched = true; // @todo this will be true after 1st data run, but there will often be more data runs.
+			
+			work->entry = (void*)0xFEEDFACEDEADBEEF;
+			sys_atomic_add_64(&ctx->buffered, (u64)-work->allocated_size);
+			assert(ctx->buffered < max_streaming_memory);
+			sys_atomic_add_64(&ctx->work_count, (u64)-1);
+			*work = (Work){0};
 		}
-		
-		work->entry->was_searched = true; // @todo this will be true after 1st data run, but there will often be more data runs.
-		
-		*work = (Work){0};
-		work->entry = (void*)0xFEEDFACEDEADBEEF;
-		sys_atomic_add_64(&ctx->buffered, (u64)-work->size);
-		sys_atomic_add_64(&ctx->work_count, (u64)-1);
 	}
-	
 	return 0;
 }
 
-s64 stream_thread_proc(Thread *t) {
-	Query_Context *ctx = (Query_Context*)t->userdata;
-	
-	System_Info sys_info = sys_get_info();
-	u64 thread_count = (u64)max(((f64)sys_info.logical_cpu_count * 0.75), 1);
-	Thread *work_threads = PushTempBuffer(Thread, thread_count);
-	Work_Context *work_contexts = PushTempBuffer(Work_Context, thread_count);
-	
-	for (u64 i = 0; i < thread_count; i += 1) {
-		Thread *tw = work_threads + i;
-		Work_Context *wctx = work_contexts + i;
-		*wctx = (Work_Context){0};
-		wctx->ctx = ctx;
+s64 stream_file_data_thread_proc(Thread *t) {
+	tm_scope("Stream file data Thread") {
+		Query_Context *ctx = (Query_Context*)t->userdata;
 		
-		sys_thread_init(tw, work_thread_proc, wctx);
-		sys_thread_start(tw);
-	}
-	
-	
-	string vol_file_name = tprint("\\\\.\\%s:", ctx->volume_name);
-	
-	u16 _cpath[MAX_PATH_LENGTH*2];
-	u16 *cpath = _cpath;
-	_win_utf8_to_wide(vol_file_name, cpath, MAX_PATH_LENGTH*2);
-	File_Handle f = CreateFileW(
-		cpath, GENERIC_READ,
-		FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
-		0, OPEN_EXISTING, /*FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING |*/ FILE_FLAG_OVERLAPPED, 0
-	);
-	
-	if (f == (File_Handle)0xffffffffffffffff) {
-		DWORD e = GetLastError();
-		print("stream_thread_proc: Could not open volume for reading. %u\n", e);
-		return 1;
-	}
-	
-	while (1) {
-		reset_temporary_storage();
+		System_Info sys_info = sys_get_info();
+		u64 thread_count = (u64)max(((f64)sys_info.logical_cpu_count * 0.75), 1);
+		Thread *work_threads = PushTempBuffer(Thread, thread_count);
+		Work_Context *work_contexts = PushTempBuffer(Work_Context, thread_count);
 		
-		sys_semaphore_wait(ctx->found_entry_sem);
-		
-		if (ctx->read_entry_count >= persistent_array_count(ctx->query->filtered_entries)) {
-			break;
+		for (u64 i = 0; i < thread_count; i += 1) {
+			Thread *tw = work_threads + i;
+			Work_Context *wctx = work_contexts + i;
+			*wctx = (Work_Context){0};
+			wctx->ctx = ctx;
+			
+			sys_thread_init(tw, work_thread_proc, wctx);
+			sys_thread_start(tw);
 		}
 		
-		Entry *entry = ctx->query->filtered_entries[ctx->read_entry_count++];
 		
-		if (!entry->valid) {
-			//entry->was_searched = true;
-			continue;
+		string vol_file_name = tprint("\\\\.\\%s:", ctx->volume_name);
+		
+		u16 _cpath[MAX_PATH_LENGTH*2];
+		u16 *cpath = _cpath;
+		_win_utf8_to_wide(vol_file_name, cpath, MAX_PATH_LENGTH*2);
+		DWORD flags = FILE_FLAG_OVERLAPPED;
+#ifdef NO_CACHE
+		flags |= FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING;
+#endif
+		
+		File_Handle f = CreateFileW(
+			cpath, GENERIC_READ,
+			FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+			0, OPEN_EXISTING, /*FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_NO_BUFFERING |*/ flags, 0
+		);
+		
+		if (f == (File_Handle)0xffffffffffffffff) {
+			DWORD e = GetLastError();
+			print("stream_file_data_thread_proc: Could not open volume for reading. %u\n", e);
+			return 1;
 		}
 		
-		if (!entry->data) {
-			//entry->was_searched = true;
-			// @todo, some file entries are missing DATA attribute, and it seems the data is to be found elsewhere. 
-			continue;
+		u64 *unique_file_counts;
+		{
+			u64 ps = sys_info.page_size;
+			u64 sz = ctx->query->vol.entry_count*sizeof(u64); // @memory this is way more than we need
+			u64 page_count = (sz+ps-1)/ps;
+			unique_file_counts = (u64*)sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
+			// @todo ?
+			assertmsg(unique_file_counts, "Out of memory");
+			memset(unique_file_counts, 0, sz);
 		}
 		
-		if (!entry->size) {
-			entry->was_searched = true;
-			continue;
-		}
-		
-		u8 *data = entry->data;
-		
-		// @cleanup data runs can theoretically be larger than max streaming memory, but we should fragment large data runs anyways.
-		// @todo notify user somehow if this happens, and what entries are skipped.
-		//if (entry->size > max_streaming_memory) {
-		//	continue;
-		//}
-		
-		if (entry->resident) {
+		tm_scope("Loop")
+		while (1) {
+			reset_temporary_storage();
 			
-			////////////
-			/// Resident file content (small, fits in 1kb file record)
+			tm_scope("Wait for Semaphore")
+			sys_semaphore_wait(ctx->found_entry_sem);
 			
-			// Busy-wait for there to be free readback memory. This shouldn't really hit
-			// unless user has a very slow CPU, or/and very low max_streaming_memory.
-			// @todo @bug This can cause program to hang. @copypaste
-			// Make sure this will exit if main thread wants to exit.
-			while (ctx->buffered+entry->size >= max_streaming_memory) {
-				Sleep(1);
-			}
-			sys_atomic_add_64(&ctx->buffered, entry->size);
-			
-			// @copypaste
-			// Next location in read_buffer 
-			u8 *next_read_buffer_pointer
-				= ctx->read_buffer + (ctx->next_buffer_index % max_streaming_memory);
-			
-			Work *w0 = 0, *w1 = 0;
-			
-			w0 = (Work *)persistent_array_push_empty(ctx->work);
-			*w0 = (Work){0};
-			w0->entry = entry;
-			w0->data = next_read_buffer_pointer;
-			
-			// This chunk might cycle around to the start of the ring buffer.
-			// So, we need to fragment it into two.
-			if (next_read_buffer_pointer + entry->size > ctx->read_buffer + max_streaming_memory) {
-				u64 s0 = 
-					(u64)(ctx->read_buffer + max_streaming_memory) - (u64)next_read_buffer_pointer;
-				s0 = align_next(s0, 512);
-				
-				w0->size = s0;
-				
-				u64 s1 = entry->size - s0;
-				
-				w1 = (Work *)persistent_array_push_empty(ctx->work);
-				*w1 = (Work){0};
-				w1->entry = entry;
-				w1->data = ctx->read_buffer;
-				w1->size = s1;
-				
-			} else {
-				w0->size = entry->size;
+			if (ctx->read_entry_count >= persistent_array_count(ctx->query->filtered_entries)) {
+				break;
 			}
 			
-			memcpy(w0->data, data, w0->size);
-			//print("Write @ %u\n", w0->data);
-			sys_atomic_add_64(&ctx->work_count, 1);
-			assert(w0->data);
-			assert(w0->size);
-			sys_semaphore_signal(&ctx->work_sem);
-			if (w1) {
-				assert(false); // remove
-				memcpy(w1->data, data + w0->size, w1->size);
-				sys_atomic_add_64(&ctx->work_count, 1);
-				assert(w1->data);
-				assert(w1->size);
-				sys_semaphore_signal(&ctx->work_sem);
+			u64 entry_index = ctx->read_entry_count++;
+			Entry *entry = ctx->query->filtered_entries[entry_index];
+			
+			if (!entry->valid) {
+				//entry->was_searched = true;
+				continue;
 			}
 			
-			ctx->next_buffer_index += align_next(entry->size, 512);
+			if (!entry->data) {
+				//entry->was_searched = true;
+				// @todo, some file entries are missing DATA attribute, and it seems the data is to be found elsewhere.
+				continue;
+			}
 			
 			
-		} else {
+			u8 *data = entry->data;
 			
-			////////////
-			/// Non-resident file content (large, scattered in data runs)
-			///  We need to parse the data runs.
+			// @cleanup data runs can theoretically be larger than max streaming memory, but we should fragment large data runs anyways.
+			// @todo notify user somehow if this happens, and what entries are skipped.
+			//if (entry->size > max_streaming_memory) {
+			//	continue;
+			//}
 			
-			u64 previous_cluster = 0;
-			u8 *p = (u8*)data;
-			
-			u64 total_data_visited = 0;
-			
-			while (*p != 0) {
+			tm_scope("Resident entry")
+			if (entry->resident) {
 				
-				u8 header_byte = *p;
-				u64 cluster_length_size = header_byte & 0x0F;
-				u64 cluster_offset_size = header_byte >> 4;
+				////////////
+				/// Resident file content (small, fits in 1kb file record)
 				
-				p += 1;
-				
-				if (cluster_length_size == 0 || cluster_offset_size == 0) {
-					// @todo looks like corrupt 2nd data run when this occurs, but the file exists and is valid. Try adding text to end of file and search for it.
-					//assert(false);
-					//break;
+				if (!entry->size) {
+					entry->was_searched = true;
+					continue;
 				}
 				
-				if (*p == 0 && *(u32*)(p+1) == 0xffffffff) {
-					// @todo looks like corrupt 2nd data run when this occurs, but the file exists and is valid. Try adding text to end of file and search for it.
-					assert(false);
-					break;
-				}
-				
-				u64 cluster_length = 0;
-				s64 cluster_offset = 0;
-				
-				assert(cluster_length_size <= 8);
-				assert(cluster_offset_size <= 8);
-				
-				memcpy(&cluster_length, p, min(cluster_length_size, 8));
-				p += cluster_length_size;
-				memcpy(&cluster_offset, p, min(cluster_offset_size, 8));
-				
-				if (cluster_length == 0 || cluster_offset == 0) {
-					// @todo looks like corrupt 2nd data run when this occurs, but the file exists and is valid. Try adding text to end of file and search for it.
-					//assert(false);
-					//break;
-				}
-				
-				//if (cluster_offset_size == 0) {
-				//	continue;
-				//}
-				
-				if (cluster_offset_size < 8) {
-					if (p[cluster_offset_size - 1] & 0x80) {
-						cluster_offset |= (~(s64)0) << (cluster_offset_size * 8);
-					}
-				}
-				
-				u64 start_cluster = (u64)((s64)previous_cluster + cluster_offset);
-				previous_cluster  = start_cluster;
-				
-				u64 offset_in_bytes = start_cluster  * ctx->query->vol.boot.sectors_per_cluster * ctx->query->vol.boot.bytes_per_sector;
-				u64 length_in_bytes = cluster_length * ctx->query->vol.boot.sectors_per_cluster * ctx->query->vol.boot.bytes_per_sector;
-				
-				assert(offset_in_bytes % ctx->query->vol.record_size == 0);
-				assert(length_in_bytes % ctx->query->vol.record_size == 0);
-								
-				if (total_data_visited + length_in_bytes > entry->size) {
-					length_in_bytes -= (total_data_visited + length_in_bytes) - entry->size;
-				}
-				
+				// Busy-wait for there to be free readback memory. This shouldn't really hit
+				// unless user has a very slow CPU, or/and very low max_streaming_memory.
 				// @todo @bug This can cause program to hang. @copypaste
 				// Make sure this will exit if main thread wants to exit.
-				while (ctx->buffered+length_in_bytes >= max_streaming_memory) {
+				while (ctx->buffered+entry->size >= max_streaming_memory) {
 					Sleep(1);
 				}
-				sys_atomic_add_64(&ctx->buffered, length_in_bytes);
 				
-				assert(ctx->next_buffer_index % 512 == 0);
+				// @copypaste
+				// Next location in read_buffer
+				u8 *next_read_buffer_pointer
+				= ctx->read_buffer + (ctx->next_buffer_index % max_streaming_memory);
 				
-				u64 work_submitted = 0;
-				while (work_submitted < length_in_bytes) {
+				Work *w0 = 0, *w1 = 0;
+				
+				w0 = (Work *)persistent_array_push_empty(ctx->work);
+				*w0 = (Work){0};
+				w0->entry = entry;
+				w0->pointer_to_match_count_for_entry = unique_file_counts + entry_index;
+				w0->data = next_read_buffer_pointer;
+				
+				// This chunk might cycle around to the start of the ring buffer.
+				// So, we need to fragment it into two.
+				if (next_read_buffer_pointer + entry->size > ctx->read_buffer + max_streaming_memory) {
+					u64 s0 =
+					(u64)(ctx->read_buffer + max_streaming_memory) - (u64)next_read_buffer_pointer;
+					s0 = align_next(s0, 512);
 					
-					assert(max_streaming_memory % 512 == 0);
+					w0->size = s0;
 					
-					u64 work_size = min(MAX_BYTES_PER_WORK, length_in_bytes-work_submitted);
+					u64 s1 = entry->size - s0;
 					
-					// Only the end of data runs should be able to be padded,
-					// Because MAX_BYTES_PER_WORK should be a multiple of 512
-					u64 work_size_padded = align_next(work_size, 512);
+					w1 = (Work *)persistent_array_push_empty(ctx->work);
+					*w1 = (Work){0};
+					w1->entry = entry;
+					w1->pointer_to_match_count_for_entry = unique_file_counts + entry_index;
+					w1->data = ctx->read_buffer;
+					w1->size = s1;
 					
-					u64 work_offset = offset_in_bytes + work_submitted;
+				} else {
+					w0->size = entry->size;
+				}
+				
+				w0->allocated_size = w0->size;
+				if (w1) w1->allocated_size = w1->size;
+				
+				memcpy(w0->data, data, w0->size);
+				sys_atomic_add_64(&ctx->buffered, w0->allocated_size);
+				assert(ctx->buffered < max_streaming_memory);
+				sys_atomic_add_64(&ctx->work_count, 1);
+				sys_semaphore_signal(&ctx->work_sem);
+				if (w1) {
+					//assert(false); // remove
+					memcpy(w1->data, data + w0->size, w1->size);
+					sys_atomic_add_64(&ctx->buffered, w1->allocated_size);
+					assert(ctx->buffered < max_streaming_memory);
+					sys_atomic_add_64(&ctx->work_count, 1);
+					sys_semaphore_signal(&ctx->work_sem);
+				}
+				
+				
+				ctx->next_buffer_index += align_next(entry->size, 512);
+				
+				
+			} else tm_scope("Non-resident entry") {
+				
+				////////////
+				/// Non-resident file content (large, scattered in data runs)
+				///  We need to parse the data runs.
+				
+				u64 previous_cluster = 0;
+				u8 *p = (u8*)data;
+				
+				u64 total_data_visited = 0;
+				
+				while (*p != 0) {
 					
-					Work *w0 = 0, *w1 = 0;
+					u8 header_byte = *p;
+					u64 cluster_length_size = header_byte & 0x0F;
+					u64 cluster_offset_size = header_byte >> 4;
+					p += 1;
 					
-					w0 = (Work *)persistent_array_push_empty(ctx->work);
-					*w0 = (Work){0};
-					w0->entry = entry;
-					w0->f = f;
-					w0->is_async = true;
-					w0->data = ctx->read_buffer + ((ctx->next_buffer_index+work_submitted) % max_streaming_memory);
-					assert((u64)w0->data % 512 == 0);
 					
-					// This chunk might cycle around to the start of the ring buffer.
-					// So, we need to fragment it into two.
-					if (w0->data + work_size_padded > ctx->read_buffer + max_streaming_memory) {
-						assert(false); // remove
-						u64 s0 = 
-							(u64)(ctx->read_buffer + max_streaming_memory) - (u64)w0->data;
-						u64 s1 = work_size_padded - s0;
-						
-						assert(s0 % 512 == 0);
-						w0->size = s0;
-						
-						w1 = (Work *)persistent_array_push_empty(ctx->work);
-						*w1 = (Work){0};
-						w1->entry = entry;
-						w1->f = f;
-						w1->is_async = true;
-						w1->data = ctx->read_buffer;
-						w1->size = s1;
-					} else {
-						w0->size = work_size;
+					u64 cluster_length = 0;
+					s64 cluster_offset = 0;
+					assert(cluster_length_size <= 8);
+					assert(cluster_offset_size <= 8);
+					memcpy(&cluster_length, p, min(cluster_length_size, 8));
+					p += cluster_length_size;
+					memcpy(&cluster_offset, p, min(cluster_offset_size, 8));
+					if (cluster_offset_size < 8) {
+						if (p[cluster_offset_size - 1] & 0x80) {
+							cluster_offset |= (~(s64)0) << (cluster_offset_size * 8);
+						}
+					}
+					u64 start_cluster = (u64)((s64)previous_cluster + cluster_offset);
+					previous_cluster  = start_cluster;
+					
+					u64 offset_in_bytes = start_cluster  * ctx->query->vol.boot.sectors_per_cluster * ctx->query->vol.boot.bytes_per_sector;
+					u64 length_in_bytes = cluster_length * ctx->query->vol.boot.sectors_per_cluster * ctx->query->vol.boot.bytes_per_sector;
+					assert(offset_in_bytes % ctx->query->vol.record_size == 0);
+					assert(length_in_bytes % ctx->query->vol.record_size == 0);
+					if (total_data_visited + length_in_bytes > entry->size) {
+						length_in_bytes -= (total_data_visited + length_in_bytes) - entry->size;
 					}
 					
-					w0->ovl = (OVERLAPPED){0};
-					w0->ovl.Offset = work_offset & 0xFFFFFFFF;
-					w0->ovl.OffsetHigh = work_offset >> 32;
-					w0->ovl.hEvent = CreateEventA(0, 1, 0, 0);
-					//print("Write @ %u\n", w0->data);
-					BOOL ok = ReadFile(f, w0->data, (DWORD)align_next(w0->size, 512), 0, &w0->ovl);
-					DWORD err = GetLastError();
-					assertmsgs(!ok || err == 997 /*ERROR_IO_PENDING*/, tprint("%u", err));
+					// @todo @bug This can cause program to hang. @copypaste
+					// Make sure this will exit if main thread wants to exit.
+					// Timeout ?
+					while (ctx->buffered+length_in_bytes >= max_streaming_memory) {
+						Sleep(1);
+					}
 					
-					sys_atomic_add_64(&ctx->work_count, 1);
-					sys_semaphore_signal(&ctx->work_sem); // signal w0
+					assert(ctx->next_buffer_index % 512 == 0);
 					
-					if (w1) {
-						assert(false); // remove
-						w1->ovl = (OVERLAPPED){0};
-						w1->ovl.Offset = (work_offset + w0->size) & 0xFFFFFFFF;
-						w1->ovl.OffsetHigh = (work_offset + w0->size) >> 32;
-						w1->ovl.hEvent = CreateEventA(0, 1, 0, 0);
+					u64 work_submitted = 0;
+					while (work_submitted < length_in_bytes) {
 						
-						ok = ReadFile(f, w1->data, (DWORD)align_next(w1->size, 512), 0, &w1->ovl);
-						err = GetLastError();
+						assert(max_streaming_memory % 512 == 0);
+						
+						u64 work_size = min(MAX_BYTES_PER_WORK, length_in_bytes-work_submitted);
+						
+						// Only the end of data runs should be able to be padded,
+						// Because MAX_BYTES_PER_WORK should be a multiple of 512
+						u64 work_size_padded = align_next(work_size, 512);
+						
+						u64 work_offset = offset_in_bytes + work_submitted;
+						
+						Work *w0 = 0, *w1 = 0;
+						
+						w0 = (Work *)persistent_array_push_empty(ctx->work);
+						*w0 = (Work){0};
+						w0->entry = entry;
+						w0->pointer_to_match_count_for_entry = unique_file_counts + entry_index;
+						w0->f = f;
+						w0->is_async = true;
+						w0->data = ctx->read_buffer + ((ctx->next_buffer_index+work_submitted) % max_streaming_memory);
+						assert((u64)w0->data % 512 == 0);
+						
+						// This chunk might cycle around to the start of the ring buffer.
+						// So, we need to fragment it into two.
+						if (w0->data + work_size_padded > ctx->read_buffer + max_streaming_memory) {
+							//assert(false); // remove
+							u64 s0 =
+							(u64)(ctx->read_buffer + max_streaming_memory) - (u64)w0->data;
+							u64 s1 = work_size_padded - s0;
+							
+							assert(s0 % 512 == 0);
+							w0->size = s0;
+							w0->allocated_size = s0;
+							
+							w1 = (Work *)persistent_array_push_empty(ctx->work);
+							*w1 = (Work){0};
+							w1->entry = entry;
+							w1->pointer_to_match_count_for_entry = unique_file_counts + entry_index;
+							w1->f = f;
+							w1->is_async = true;
+							w1->data = ctx->read_buffer;
+							w1->size = s1;
+							w1->allocated_size = align_next(s1, 512);
+						} else {
+							w0->size = work_size;
+							w0->allocated_size = work_size_padded;
+						}
+						
+						w0->ovl = (OVERLAPPED){0};
+						w0->ovl.Offset = work_offset & 0xFFFFFFFF;
+						w0->ovl.OffsetHigh = work_offset >> 32;
+						w0->ovl.hEvent = CreateEventA(0, 1, 0, 0);
+						//print("Write @ %u\n", w0->data);
+						BOOL ok = ReadFile(f, w0->data, (DWORD)w0->allocated_size, 0, &w0->ovl);
+						sys_atomic_add_64(&ctx->buffered, w0->allocated_size);
+						assert(ctx->buffered < max_streaming_memory);
+						DWORD err = GetLastError();
 						assertmsgs(!ok || err == 997 /*ERROR_IO_PENDING*/, tprint("%u", err));
 						
 						sys_atomic_add_64(&ctx->work_count, 1);
-						sys_semaphore_signal(&ctx->work_sem); // signal w1
+						sys_semaphore_signal(&ctx->work_sem); // signal w0
+						
+						if (w1) {
+							//assert(false); // remove
+							w1->ovl = (OVERLAPPED){0};
+							w1->ovl.Offset = (work_offset + w0->size) & 0xFFFFFFFF;
+							w1->ovl.OffsetHigh = (work_offset + w0->size) >> 32;
+							w1->ovl.hEvent = CreateEventA(0, 1, 0, 0);
+							
+							ok = ReadFile(f, w1->data, (DWORD)w1->allocated_size, 0, &w1->ovl);
+							sys_atomic_add_64(&ctx->buffered, w1->allocated_size);
+							assert(ctx->buffered < max_streaming_memory);
+							err = GetLastError();
+							assertmsgs(!ok || err == 997 /*ERROR_IO_PENDING*/, tprint("%u", err));
+							
+							sys_atomic_add_64(&ctx->work_count, 1);
+							sys_semaphore_signal(&ctx->work_sem); // signal w1
+						}
+						
+						work_submitted += work_size;
 					}
 					
-					work_submitted += work_size;
+					ctx->next_buffer_index += align_next(length_in_bytes, 512);
+					
+					p += cluster_offset_size;
+					total_data_visited += length_in_bytes;
 				}
-				
-				ctx->next_buffer_index += align_next(length_in_bytes, 512);
-				
-				p += cluster_offset_size;
-				total_data_visited += length_in_bytes;
 			}
 		}
+		
+		tm_scope("Wait workers & cleanup") {
+			for (u64 i = 0; i < thread_count; i += 1) {
+				sys_semaphore_signal(&ctx->work_sem);
+			}
+			print("Stream thread waiting for threads...\n");
+			for (u64 i = 0; i < thread_count; i += 1) {
+				Thread *tw = work_threads + i;
+				sys_thread_join(tw);
+				sys_thread_close(tw);
+			}
+			print("Stream thread done\n");
+			
+			ctx->query->end_time = sys_get_seconds_monotonic();
+			if (ctx->done_flag) *ctx->done_flag = true;
+			
+			CloseHandle(f);
+			
+			sys_unmap_pages(unique_file_counts);
+		}
 	}
-	
-	for (u64 i = 0; i < thread_count; i += 1) {
-		sys_semaphore_signal(&ctx->work_sem);
-	}
-	for (u64 i = 0; i < thread_count; i += 1) {
-		Thread *tw = work_threads + i;
-		sys_thread_join(tw);
-		sys_thread_close(tw);
-	}
-	
-	if (ctx->done_flag) *ctx->done_flag = true;
-	
-	CloseHandle(f);
-	
 	return 0;
 }
 
-Query query_volume(Volume_Database vol, Entry *directory, string *filters, u64 filter_count, string *search_terms, u64 search_term_count, bool *done_flag) {
-	Query query = (Query){0};
-	query.vol = vol;
+
+typedef struct Child_Iterator {
+	Entry *last;
+	Entry *parent_stack[1024]; // Symlink reasons
+	u64 parent_count;
+} Child_Iterator;
+
+Entry *get_next_child(Child_Iterator *it, Entry *directory) {
+	Entry *cur = it->last;
+
+	if (!cur) {
+		it->parent_count = 0;
+		it->last = (directory && directory->first_child) ? directory->first_child : 0;
+		if (it->last) {
+			it->parent_stack[it->parent_count++] = directory;
+		}
+		return it->last;
+	}
+
+	if (cur->is_directory && cur->first_child) {
+		if (it->parent_count < (sizeof(it->parent_stack) / sizeof(it->parent_stack[0]))) {
+			it->parent_stack[it->parent_count++] = cur;
+			it->last = cur->first_child;
+			return it->last;
+		}
+	}
+
+	if (cur->next_sibling) {
+		it->last = cur->next_sibling;
+		return it->last;
+	}
+
+	while (it->parent_count > 0) {
+		Entry *parent = it->parent_stack[it->parent_count - 1];
+		it->parent_count--;
+
+		if (parent == directory) {
+			it->last = 0;
+			return 0;
+		}
+
+		if (parent->next_sibling) {
+			it->last = parent->next_sibling;
+			return it->last;
+		}
+	}
+
+	it->last = 0;
+	return 0;
+}
+
+void query_volume(Query *query, Volume_Database vol, Entry *directory, string *filters, u64 filter_count, string *search_terms, u64 search_term_count, bool *done_flag) {
+	f64 start_time = sys_get_seconds_monotonic();
+	*query = (Query) {0};
+	query->vol = vol;
+	query->start_time = start_time;
 	
 	if (done_flag) *done_flag = false;
 	
-	query.ctx = (Query_Context){0};
+	query->ctx = (Query_Context){0};
 	{
 		u64 ps = sys_get_info().page_size;
 		u64 page_count = (max_streaming_memory+ps+512)/ps;
-		query.ctx.read_buffer = sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
-		query.ctx.read_buffer = (u8*)(uintptr)align_next((u64)query.ctx.read_buffer, 512);
+		query->ctx.read_buffer = sys_map_pages(SYS_MEMORY_RESERVE | SYS_MEMORY_ALLOCATE, 0, page_count, false);
+		query->ctx.read_buffer = (u8*)(uintptr)align_next((u64)query->ctx.read_buffer, 512);
 		
-		persistent_array_init((void**)&query.ctx.work, sizeof(Work));
+		persistent_array_init((void**)&query->ctx.work, sizeof(Work));
 		
-		query.ctx.query = &query;
+		query->ctx.query = query;
 		
-		query.ctx.search_terms = search_terms;
-		query.ctx.search_term_count = search_term_count;
+		query->ctx.search_terms = search_terms;
+		query->ctx.search_term_count = search_term_count;
 		
-		sys_semaphore_init(&query.ctx.found_entry_sem);
-		sys_semaphore_init(&query.ctx.work_sem);
-		sys_mutex_init(&query.ctx.match_mutex);
-		query.ctx.match_strings_arena = make_arena(GiB(16), MiB(1));
+		sys_semaphore_init(&query->ctx.found_entry_sem);
+		sys_semaphore_init(&query->ctx.work_sem);
+		sys_mutex_init(&query->ctx.match_mutex);
+		query->ctx.match_strings_arena = make_arena(GiB(16), MiB(1));
 		
-		query.ctx.volume_name = vol.name;
+		query->ctx.volume_name = vol.name;
 		
-		query.ctx.done_flag = done_flag;
+		query->ctx.done_flag = done_flag;
 	}
 	
-	persistent_array_init((void**)&query.child_entries, sizeof(Entry*));
-	persistent_array_init((void**)&query.filtered_entries, sizeof(Entry*));
-	persistent_array_init((void**)&query.matches, sizeof(Match));
+	persistent_array_init((void**)&query->filtered_entries, sizeof(Entry*));
+	persistent_array_init((void**)&query->matches, sizeof(Match));
 	
 	
 	if (search_term_count > 0) {
-		sys_thread_init(&query.ctx.stream_thread, stream_thread_proc, &query.ctx);
-		sys_thread_start(&query.ctx.stream_thread);
+		sys_thread_init(&query->ctx.stream_thread, stream_file_data_thread_proc, &query->ctx);
+		sys_thread_start(&query->ctx.stream_thread);
 	}
-	
-	timestamp_begin(STR("Find children of search directory"));
-	for (u64 i = 0; i < vol.entry_count; i += 1) {
-		Entry *entry = &vol.entries[i];
-		
-		
-		if (!entry->valid)          continue;
-		//Entry *p = *entry->pointer_to_parent_entry;
-		//if (strings_match(p->name, STR("DOWNLO~1")) && strings_match((*p->pointer_to_parent_entry)->name, STR("charl"))) __debugbreak();
-		if (!entry->ready)          continue;
-		if (entry->name.count == 0) continue;
-		
-		if (entry->is_directory)    continue;
-		
-		if (entry->pointer_to_parent_entry) {
-			bool search_dir_is_ancestor = false;
-			
-			Entry *next = entry;
-			
-			while (next->valid && *next->pointer_to_parent_entry && *next->pointer_to_parent_entry != next) {
-				if (*next->pointer_to_parent_entry == directory) {
-					search_dir_is_ancestor = true;
-					break;
-				}
-				next = *next->pointer_to_parent_entry;
-			}
-			
-			if (!search_dir_is_ancestor) continue;
-			
-			persistent_array_push_copy(query.child_entries, &entry);
-		}
-	}
-	timestamp_end(STR("Find children of search directory"));
 	
 	timestamp_begin(STR("Find children which match filter"));
+	
 	if (filter_count == 0) {
-		for (u64 i = 0; i < persistent_array_count(query.child_entries); i += 1) {
-			Entry *entry = query.child_entries[i];
+		Child_Iterator it = (Child_Iterator){0};
+		Entry *entry;
+		while ((entry = get_next_child(&it, directory))) {
+			if (entry->is_directory) continue; // @todo Display directories when searching file names, but differently
 			entry->was_searched = false;
-			persistent_array_push_copy(query.filtered_entries, &entry);
-			sys_semaphore_signal(&query.ctx.found_entry_sem);
+			persistent_array_push_copy(query->filtered_entries, &entry);
+			sys_semaphore_signal(&query->ctx.found_entry_sem);
 		}
 	} else {
-		for (u64 i = 0; i < persistent_array_count(query.child_entries); i += 1) {
-			Entry *entry = query.child_entries[i];
+		Child_Iterator it = (Child_Iterator){0};
+		Entry *entry;
+		
+		while ((entry = get_next_child(&it, directory))) {
+			
+			if (!entry->valid) continue;
+			
 			bool any_match = false;
 			
 			string name = entry->name;
@@ -1890,6 +2269,7 @@ Query query_volume(Volume_Database vol, Entry *directory, string *filters, u64 f
 				bool suffix_wildcard = filter.data[filter.count-1] == '*';
 				
 				if (strings_match(string_trim(filter), STR("*"))) {
+					if (entry->is_directory) continue; // @todo Display directories when searching file names, but differently
 					any_match  = true;
 					break;
 				}
@@ -1937,35 +2317,35 @@ Query query_volume(Volume_Database vol, Entry *directory, string *filters, u64 f
 			
 			if (any_match) {
 				entry->was_searched = false;
-				persistent_array_push_copy(query.filtered_entries, &entry);
-				sys_semaphore_signal(&query.ctx.found_entry_sem);
+				persistent_array_push_copy(query->filtered_entries, &entry);
+				sys_semaphore_signal(&query->ctx.found_entry_sem);
 			}
+			
 		}
 	}
 	timestamp_end(STR("Find children which match filter"));
 	
-	
-	return query;
+	sys_semaphore_signal(&query->ctx.found_entry_sem);
 }
 
-void query_free(Query query) {
+void query_free(Query *query) {
 	
-	sys_semaphore_signal(&query.ctx.found_entry_sem);
-	if (query.ctx.search_term_count > 0) {
-		sys_thread_join(&query.ctx.stream_thread);
-		sys_thread_close(&query.ctx.stream_thread);
+	print("Query free\n"); // @cleanup
+	
+	if (query->ctx.search_term_count > 0) {
+		sys_thread_join(&query->ctx.stream_thread);
+		sys_thread_close(&query->ctx.stream_thread);
 	}
 	
-	sys_unmap_pages(query.ctx.read_buffer);
-	persistent_array_uninit(query.ctx.work);
-	sys_semaphore_release(query.ctx.found_entry_sem);
-	sys_semaphore_release(query.ctx.work_sem);
-	sys_mutex_uninit(&query.ctx.match_mutex);
-	free_arena(query.ctx.match_strings_arena);
+	sys_unmap_pages(query->ctx.read_buffer);
+	persistent_array_uninit(query->ctx.work);
+	sys_semaphore_release(query->ctx.found_entry_sem);
+	sys_semaphore_release(query->ctx.work_sem);
+	sys_mutex_uninit(&query->ctx.match_mutex);
+	free_arena(query->ctx.match_strings_arena);
 	
-	persistent_array_uninit(query.child_entries);
-	persistent_array_uninit(query.filtered_entries);
-	persistent_array_uninit(query.matches);
+	persistent_array_uninit(query->filtered_entries);
+	persistent_array_uninit(query->matches);
 }
 
 u64 parse_filters(string full_filter, string *filters, u64 max_count) {
@@ -2000,11 +2380,21 @@ void print_stats(Volume_Database vol, Query query) {
 	f64 mb = (f64)vol.bytes_read/1024.0/1024.0;
 	print("\tFile record bytes read: %f MB\n", mb);
 	
-	u64 entry_data_size = ((u64)vol.entry_data_arena.position - (u64)vol.entry_data_arena.start);
+	u64 entry_names_size = ((u64)vol.entry_names_arena.position - (u64)vol.entry_names_arena.start);
+	u64 small_data_size = ((u64)vol.entry_small_data_arena.position - (u64)vol.entry_small_data_arena.start);
+	u64 data_runs_size = ((u64)vol.entry_data_runs_arena.position - (u64)vol.entry_data_runs_arena.start);
 	u64 entries_size = vol.entry_count * sizeof(Entry);
 	
-	mb = (f64)(entry_data_size + entries_size) / MiB(1);
+	mb = (f64)(entry_names_size + entries_size + small_data_size + data_runs_size) / MiB(1);
 	print("Volume database RAM usage: %f MB\n", mb);
+	mb = (f64)entry_names_size / MiB(1);
+	print("\tEntry Names: %f MB\n", mb);
+	mb = (f64)small_data_size / MiB(1);
+	print("\tSmall File Data: %f MB\n", mb);
+	mb = (f64)data_runs_size / MiB(1);
+	print("\tData Runs: %f MB\n", mb);
+	mb = (f64)entries_size / MiB(1);
+	print("\tIndexed Entry Data: %f MB\n", mb);
 	
 	print("Query:\n");
 	print("\tTotal file records processed: %u\n", vol.entry_count);
@@ -2021,9 +2411,9 @@ void print_stats(Volume_Database vol, Query query) {
 }
 
 int main(int argc, char **argv) {
-
+	
 	max_streaming_memory = align_next(max_streaming_memory, 512);
-
+	
 	string search_directory = STR("");
 	bool has_search_directory = false;
 	string search_term = STR("*"); (void)search_term;
@@ -2146,7 +2536,8 @@ int main(int argc, char **argv) {
 			search_term_count = 0;
 		}
 		
-		Query query = query_volume(vol, search_directory_entry, filters, filter_count, &search_term, search_term_count, 0);
+		Query query;
+		query_volume(&query, vol, search_directory_entry, filters, filter_count, &search_term, search_term_count, 0);
 		assert(false); // @todo wait for query to complete
 		
 		//for (u64 i = 0; i < persistent_array_count(query.filtered_entries); i += 1) {
@@ -2170,9 +2561,10 @@ int main(int argc, char **argv) {
 
 int gui_callback(struct nk_context *ctx)
 {
-	static char dir[MAX_PATH]         = {0};
-	static char filter[MAX_FILTER]    = {0};
-	static char search_str[MAX_SEARCH]= {0};
+	static char dir[MAX_PATH]         = "C:/The-Forge/Examples_3/Unit_Tests/PC_VS2019/x64/Debug/09_LightShadowPlayground/SDF";
+	//static char dir[MAX_PATH]         = "C:";
+	static char filter[MAX_FILTER]    = "*.c, *.cpp, *.h, *.hpp, *.txt, *.json, *.xml, *.html";
+	static char search_str[MAX_SEARCH]= "Hello";
 	static string search_term;
 	static Query queries[1024];
 	static u64 query_count = 0;
@@ -2203,14 +2595,19 @@ int gui_callback(struct nk_context *ctx)
 	if (nk_button_label(ctx, "Search")) {
 		
 		for (u64 i = 0; i < query_count; i += 1) {
-			query_free(queries[i]);
+			query_free(&queries[i]);
 		}
 		query_count = 0;
 		
-		string dirs = STR(dir);
-		sys_get_absolute_path(get_temp(), dirs, &dirs);
+		string sdir = STR(dir);
 		
-		s64 dir_colon_index = string_find_index_from_left(dirs, STR(":"));
+		if (sdir.count == 2 && sdir.data[1] == ':') {
+			sdir = tprint("%s\\", sdir);
+		}
+		
+		sys_get_absolute_path(get_temp(), sdir, &sdir);
+		
+		s64 dir_colon_index = string_find_index_from_left(sdir, STR(":"));
 		
 		bool one_volume = dir_colon_index != -1;
 		
@@ -2219,9 +2616,9 @@ int gui_callback(struct nk_context *ctx)
 			
 			if (one_volume) {
 				
-				if (strings_match(string_slice(dirs, 0, (u64)dir_colon_index), vol.name)) {
-				
-					Entry *search_directory_entry = full_path_to_entry_directory(vol, dirs);
+				if (strings_match(string_slice(sdir, 0, (u64)dir_colon_index), vol.name)) {
+					
+					Entry *search_directory_entry = full_path_to_entry_directory(vol, sdir);
 					if (!search_directory_entry) {
 						print("Could not find search directory entry\n");
 						continue;
@@ -2231,11 +2628,12 @@ int gui_callback(struct nk_context *ctx)
 					u64 filter_count = parse_filters(STR(filter), filters, 2048);
 					
 					u64 search_term_count = 1;
-		
+					
 					if (search_term.count == 0 || strings_match(search_term, STR("*"))) {
 						search_term_count = 0;
 					}
-					queries[query_count++] = query_volume(vol, search_directory_entry, filters, filter_count, &search_term, search_term_count, &query_done);
+					Query *q = &queries[query_count++];
+					query_volume(q, vol, search_directory_entry, filters, filter_count, &search_term, search_term_count, &query_done);
 					
 					print_stats(vol, queries[query_count-1]);
 					timestamp_count = 0;
@@ -2251,7 +2649,7 @@ int gui_callback(struct nk_context *ctx)
 	}
 	if (nk_button_label(ctx, "Clear")) {
 		for (u64 i = 0; i < query_count; i += 1) {
-			query_free(queries[i]);
+			query_free(&queries[i]);
 		}
 		query_count = 0;
 		selected     = -1;
@@ -2259,11 +2657,6 @@ int gui_callback(struct nk_context *ctx)
 	if (nk_button_label(ctx, "debugbreak")) {
 		__debugbreak();
 	}
-	
-	struct nk_rect region = nk_window_get_content_region(ctx);
-	struct nk_rect last = nk_widget_bounds(ctx);
-	float used = (last.y + last.h) - region.y;
-	float remaining = region.h - used;
 	
 	for (u64 i = 0; i < state.vol_count; i += 1) {
 		Volume_State *vstate = state.vol_states + i;
@@ -2283,6 +2676,8 @@ int gui_callback(struct nk_context *ctx)
 	u64 files_searched = 0;
 	u64 file_count = 0;
 	u64 matches_found = 0;
+	u64 unique_file_count = 0;
+	f64 query_time = 0.0;
 	
 	if (query_count > 0) {
 		Query *query = &queries[0];
@@ -2296,10 +2691,22 @@ int gui_callback(struct nk_context *ctx)
 		file_count = persistent_array_count(query->filtered_entries);
 		
 		matches_found = persistent_array_count(query->matches);
+		if (!matches_found) matches_found = persistent_array_count(query->filtered_entries);
+		
+		unique_file_count = query->unique_files_with_any_match_count;
+		
+		query_time = query_done ? query->end_time - query->start_time : sys_get_seconds_monotonic() - query->start_time;
+		
+		
 	}
 	string s = query_done ? STR("Done") : STR("Querying...");
-	string query_state_text = tprint("%s. Files searched: %u/%u, Matches found: %u", s, files_searched, file_count, matches_found);
+	string query_state_text = tprint("%s. (%f s) Files searched: %u/%u, Matches found: %u, in %u files.", s, query_time, files_searched, file_count, matches_found, unique_file_count);
 	nk_text(ctx, (char*)query_state_text.data, (int)query_state_text.count, NK_TEXT_LEFT);
+	
+	struct nk_rect region = nk_window_get_content_region(ctx);
+	struct nk_rect last = nk_widget_bounds(ctx);
+	float used = (last.y + last.h) - region.y;
+	float remaining = region.h - used;
 	
 	nk_layout_row_dynamic(ctx, remaining, 1);
 	if (nk_group_scrolled_begin(ctx,
@@ -2310,6 +2717,16 @@ int gui_callback(struct nk_context *ctx)
 		if (query_count > 0) {
 			Query *query = &queries[0];
 			
+			
+			string open_command = tprint("explorer.exe /select,");
+			
+			// Look for a good file explorer. If none is found, just use windows explorer.
+			char dummy[2048];
+			DWORD result = SearchPathA(0, "FPilot.exe", 0, 2048, dummy, 0);
+			if (result > 0) {
+				open_command = tprint("FPilot.exe ");
+			}
+			
 			if (persistent_array_count(query->matches) == 0) {
 				nk_layout_row_dynamic(ctx, 20, 1);
 				for (u64 j = 0; j < persistent_array_count(query->filtered_entries); ++j) {
@@ -2318,7 +2735,7 @@ int gui_callback(struct nk_context *ctx)
 					nk_bool is_sel = (selected == (s64)j);
 					if (nk_selectable_text(ctx, (char*)name.data, (int)name.count, NK_TEXT_LEFT, &is_sel)) {
 						if (selected == (s64)j) {
-							sys_run_command_easy(tprint("explorer.exe /select,\"%s\"", name), sys_get_stdout(), sys_get_stderr(), STR("."));
+							sys_run_command_easy(tprint("%s\"%s\"", open_command, name), sys_get_stdout(), sys_get_stderr(), STR("."), false);
 						}
 						selected = (s64)j;
 					}
@@ -2332,7 +2749,7 @@ int gui_callback(struct nk_context *ctx)
 					nk_bool is_sel = (selected == (s64)j);
 					if (nk_selectable_text(ctx, (char*)name.data, (int)name.count, NK_TEXT_LEFT, &is_sel)) {
 						if (selected == (s64)j) {
-							sys_run_command_easy(tprint("explorer.exe /select,\"%s\"", name), sys_get_stdout(), sys_get_stderr(), STR("."));
+							sys_run_command_easy(tprint("%s\"%s\"", open_command, name), sys_get_stdout(), sys_get_stderr(), STR("."), false);
 						}
 						selected = (s64)j;
 					}
@@ -2345,13 +2762,11 @@ int gui_callback(struct nk_context *ctx)
 						nk_bool is_sel = (selected == (s64)j);
 						if (nk_selectable_text(ctx, (char*)name.data, (int)name.count, NK_TEXT_LEFT, &is_sel)) {
 							if (selected == (s64)j) {
-								sys_run_command_easy(tprint("explorer.exe /select,\"%s\"", name), sys_get_stdout(), sys_get_stderr(), STR("."));
+								sys_run_command_easy(tprint("%s\"%s\"", open_command, name), sys_get_stdout(), sys_get_stderr(), STR("."), false);
 							}
 							selected = (s64)j;
 						}
-						if (entry->is_attr_list) {
-							nk_text(ctx, "<Has Attr list>", (int)c_style_strlen("<Has Attr list>"), NK_TEXT_LEFT);
-						} else if (entry->data == 0) {
+						if (entry->data == 0) {
 							nk_text(ctx, "<Dataless>", (int)c_style_strlen("<Dataless>"), NK_TEXT_LEFT);
 						} else if (!entry->valid) {
 							nk_text(ctx, "<Invalid>", (int)c_style_strlen("<Invalid>"), NK_TEXT_LEFT);
@@ -2399,13 +2814,6 @@ s64 task_thread(Thread *t) {
 		switch (task->kind) {
 			case TASK_INDEX_VOLUME: {
 				task->result->success = index_volume(task->volume_name, task->vol);
-				break;
-			}
-			case TASK_QUERY_VOLUME: {
-				task->result->partial = !task->vol->done;
-				Entry *search_directory_entry = full_path_to_entry_directory(*task->vol, task->search_directory);
-				*task->query = query_volume(*task->vol, search_directory_entry, task->filters, task->filter_count, task->search_terms, task->search_term_count, 0);
-				task->result->success = true;
 				break;
 			}
 			
