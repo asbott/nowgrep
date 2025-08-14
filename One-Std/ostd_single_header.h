@@ -1,0 +1,1 @@
+C:/One-Std/ostd_single_header.h
