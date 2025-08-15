@@ -1,10 +1,29 @@
 
+//#define NO_CACHE
+
+//#define VERY_DEBUG
+
 #define OSTD_IMPL
 #include "One-Std/one-headers/one_system.h"
 #include "One-Std/one-headers/one_print.h"
 #include "One-Std/one-headers/one_math.h"
 #include "One-Std/one-headers/one_unicode.h"
 #include "One-Std/one-headers/one_path_utils.h"
+
+#ifdef __clang__
+#pragma clang diagnostic ignored "-Wcovered-switch-default"
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+#pragma clang diagnostic ignored "-Wunknown-warning-option"
+#pragma clang diagnostic ignored "-Wc2x-compat"
+#pragma clang diagnostic ignored "-Wcast-qual"
+#pragma clang diagnostic ignored "-Wdeclaration-after-statement"
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+#pragma clang diagnostic ignored "-Wunused-macros"
+#pragma clang diagnostic ignored "-Wfloat-equal"
+#pragma clang diagnostic ignored "-Wcast-align"
+#pragma clang diagnostic ignored "-Wmissing-variable-declarations"
+#pragma clang diagnostic ignored "-Wreserved-identifier"
+#endif
 
 #include "temporary_nonsense_for_nuklear.h"
 
@@ -103,7 +122,7 @@ void profiler_report_time(string name, f64 count, f64 start) {
 	arena_push_string(&profiler->arena, STR("},"));
 }
 
-//#define ENABLE_PROFILING
+#define ENABLE_PROFILING
 
 f64 seconds_since_init(void) {
 	local_persist f64 start = 0.0;
@@ -422,10 +441,28 @@ typedef struct BY_HANDLE_FILE_INFORMATION {
 // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle
 BOOL GetFileInformationByHandle(HANDLE hFile, LPBY_HANDLE_FILE_INFORMATION lpFileInformation);
 
+
+typedef enum _Entry_Flags {
+	ENTRY_FLAG_RESIDENT = 1 << 0,
+	ENTRY_FLAG_DIRECTORY = 1 << 1,
+	ENTRY_FLAG_VALID = 1 << 2,
+	ENTRY_FLAG_WAS_SEARCHED = 1 << 3,
+	ENTRY_FLAG_USA_APPLIED = 1 << 4,
+	ENTRY_FLAG_ALIAS = 1 << 5,
+	ENTRY_FLAG_ALIAS_RESOLVED = 1 << 6,
+	ENTRY_FLAG_SYSTEM = 1 << 7,
+	ENTRY_FLAG_HIDDEN = 1 << 8,
+	ENTRY_FLAG_UNHANDLED_DATALESS = 1 << 9,
+	ENTRY_FLAG_UNHANDLED_NON_RESIDENT_ATTRIBUTE_LIST = 1 << 10,
+	ENTRY_FLAG_UNHANDLED_HARD_LINK = 1 << 11,
+	ENTRY_FLAG_HAD_ATTRIBUTE_LIST = 1 << 12,
+} _Entry_Flags;
+typedef u16 Entry_Flags;
+
 // @todo @memory compress this as much as possible
 // - u32 entry indices instead of pointers
 // - u16 string length? Make name u32 offset into string pool, u16 length (u48 total, currently u128)
-// - Flags
+// - 
 typedef struct Entry {
 		
 	string name;
@@ -433,18 +470,16 @@ typedef struct Entry {
 	u64 size; // Size of file data
 	
 	struct Entry *parent;
-	struct Entry *next_sibling;
+	struct Entry *next_sibling; // This will be used on invalid entries for making a linked list of free entries
 	struct Entry *first_child;
 	
-	// Mike acton would cry (@todo flags)
-	bool resident; // If resident, offset is to raw data, if non resident, offset is to data runs
-	bool is_directory;
-	bool valid;
-	bool ready;
-	bool was_searched;
-	bool usa_applied;
-	bool is_symlink; // If symlink, first_child is set to the entry being linked to, and all other members are ignored
+	Entry_Flags flags;
 } Entry;
+
+typedef struct Entry_Reference {
+	struct Entry_Reference *parent;
+	Entry *entry;
+} Entry_Reference;
 
 typedef struct Volume_Database {
 	volatile Ntfs_Boot_Sector boot;
@@ -455,6 +490,11 @@ typedef struct Volume_Database {
 	
 	Entry *entries;
 	u64 entry_count;
+	
+	Entry *impostors; // persistent array (initialized if needed)
+	
+	Entry *first_invalid;
+	u64 invalid_count;
 	
 	Arena entry_names_arena; // Small file contents & data runs ++ entry name strings
 	Arena entry_small_data_arena;
@@ -595,11 +635,26 @@ void timestamp_end(string label) {
 
 #define MAX_CONTEXT_PREVIEW_LINE_LENGTH (80)
 
-#define BYTES_PER_READBACK (MiB(32))
+#define BYTES_PER_READBACK (MiB(256))
 #define MAX_BYTES_PER_WORK (MiB(1)) // MUST BE MULTIPLE OF 512
 unit_local u64 max_streaming_memory = GiB(3);
 unit_local bool is_entire_volume_search = false;
 unit_local bool is_command_line = false;
+
+string tprint_entry_full_path(string volume_label, Entry *entry) {
+	string dirpath = STR("");
+	
+	Entry *parent = entry->parent;
+	while (parent && parent != parent->parent && !strings_match(parent->name, STR("."))) {
+		dirpath = tprint("%s\\%s", parent->name, dirpath);
+		
+		parent = parent->parent;
+	}
+	
+	dirpath = tprint("%s:\\%s", volume_label, dirpath);
+	
+	return tprint("%s%s", dirpath, entry->name);
+}
 
 // @speed very slow but works for now
 // - Sorting with a radix/base of 10. Should do 256 (that way each "digit" is a byte),
@@ -811,6 +866,80 @@ s64 stream_mft_thread_proc(Thread *t) {
 	return 0;
 }
 
+typedef struct Child_Iterator {
+	Entry *last;
+	bool abort_current_children;
+} Child_Iterator;
+
+
+bool get_next_child(Child_Iterator *it, Entry *directory, Entry **next, s64 *vertical_steps, u64 *horizontal_steps) {
+
+	if (!directory->first_child) {
+		*next = 0;
+		*it = (Child_Iterator) {0};
+		return false;
+	}
+
+	Entry *cur = it->last;
+	
+	if (vertical_steps) *vertical_steps = 0;
+	if (horizontal_steps) *horizontal_steps = 0;
+	
+	if (!cur) {
+		it->last = directory->first_child;
+		if (vertical_steps) *vertical_steps = 0;
+		*next = it->last;
+		return true;
+	}
+	
+	if (!it->abort_current_children && (cur->flags & ENTRY_FLAG_DIRECTORY) && cur->first_child) {
+		Entry *child = cur->first_child;
+		
+		if ((it->last->flags & ENTRY_FLAG_DIRECTORY) && vertical_steps) *vertical_steps += 1;
+		
+		it->last = child;
+		*next = it->last;
+		
+		return true;
+	}
+	
+	it->abort_current_children = false;
+	
+	if (cur->next_sibling) {
+		it->last = cur->next_sibling;
+		if ((it->last->flags & ENTRY_FLAG_DIRECTORY) && horizontal_steps) *horizontal_steps += 1;
+		*next = it->last;
+		return true;
+	}
+	
+	Entry *next_parent = it->last->parent;
+	while (1) {
+		
+		if (vertical_steps) *vertical_steps -= 1;
+		
+		if (next_parent == directory) {
+			it->last = 0;
+			*next =  0;
+			return false;
+		}
+
+		if (next_parent->next_sibling) {
+			it->last = next_parent->next_sibling;
+			if ((it->last->flags & ENTRY_FLAG_DIRECTORY) && horizontal_steps) *horizontal_steps += 1;
+			*next = it->last;
+			return true;
+		}
+		
+		assert(next_parent != next_parent->parent);
+		
+		next_parent = next_parent->parent;
+	}
+}
+
+void abort_children_of_current_entry(Child_Iterator *it) {
+	it->abort_current_children = true;
+}
+
 typedef struct Attribute_Processing_Context {
 	Stream_Mft_Context *stream_ctx;
 	u64 file_record_index;
@@ -828,28 +957,22 @@ typedef struct Scattered_Attribute {
 } Scattered_Attribute;
 
 void finalize_entry(Volume_Database *vol, Attribute_Processing_Context *ctx, Entry *next_entry) {
-	if (!next_entry->valid) return;
+	if (!(next_entry->flags & ENTRY_FLAG_VALID)) return;
 	
-	//if (!(rec->flags & FILE_FLAGS_Compressed) && !(rec->flags & FILE_FLAGS_Encrypted)) {
-		if (!next_entry->is_directory && !string_starts_with(next_entry->name, STR("$")) && ctx->has_name) {
-			if (!next_entry->data) {
-				vol->dataless_count += 1;
-				//next_entry->valid = false;
-			}
+	if (!(next_entry->flags & ENTRY_FLAG_DIRECTORY) && !string_starts_with(next_entry->name, STR("$")) && ctx->has_name) {
+		if (!next_entry->data) {
+			vol->dataless_count += 1;
+			next_entry->flags |= ENTRY_FLAG_UNHANDLED_DATALESS;
+		} else {
+			next_entry->flags &= ~ENTRY_FLAG_UNHANDLED_DATALESS;
 		}
-		
-		next_entry->ready = true;
-	//}
+	}
 	
-	if (!next_entry->valid) return;
+	if (!(next_entry->flags & ENTRY_FLAG_VALID)) return;
 	
-	//if ((rec->flags & FILE_FLAGS_Compressed) || (rec->flags & FILE_FLAGS_Encrypted)) {
-	//	vol->compressed_count += 1;
-	//	next_entry->valid = false; // @todo
-	//}
 	if (!ctx->has_name) {
 		vol->unnamed_count += 1;
-		next_entry->valid = false; // @todo
+		next_entry->flags &= ~(ENTRY_FLAG_VALID);
 	} else assert(next_entry->name.count > 0 && next_entry->name.data != 0);
 }
 
@@ -885,36 +1008,70 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 	bool attr_named = attr_header_base->name_length > 0;
 	bool resident = attr_header_base->non_resident == 0;
 	
-	if (attr_header_base->type == ATTR_FILE_NAME /*&& !has_name  @todo, symlinks? */) {
+	if (attr_header_base->type == ATTR_STANDARD_INFORMATION) { 
+		assert(!attr_named && resident);
+		
+		Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
+		
+		Standard_Information *attr = (Standard_Information *)(attr_header->attr_and_maybe_name);
+		
+		if (attr->dos_file_permission & FILE_PERMISSION_System) {
+			next_entry->flags |= ENTRY_FLAG_SYSTEM;
+		}
+		
+		if (attr->dos_file_permission & FILE_PERMISSION_Hidden) {
+			next_entry->flags |= ENTRY_FLAG_HIDDEN;
+		}
+		
+	} else if (attr_header_base->type == ATTR_FILE_NAME) {
 		assert(!attr_named && resident);
 		
 		Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
 		
 		File_Name *attr = (File_Name *)(attr_header->attr_and_maybe_name);
 		
+		
 		u64 name_length = attr->file_name_length*3+1;
 		
 		string name = string_allocate(arena_allocator(&vol->entry_names_arena), name_length);
 		name.count = (u64)WideCharToMultiByte(CP_UTF8, 0, (LPCWCH)attr->name, (int)attr->file_name_length, (char*)name.data, (int)name.count, 0, 0);
 		
+		//if (strings_match(name, STR("amd64_userexperience-core_31bf3856ad364e35_10.0.22621.5547_none_980aaa50465ebb77"))) __debugbreak();
+		
+		if (vol->name.data[0] == 'C' && next_entry-vol->entries == 179134) {
+			print("%s\n", name);
+		}
+		
+		if (attr->file_name_namespace == 2) {
+			return true;
+		}
+		
 		if (string_starts_with(name, STR("$"))) {
-			next_entry->valid = false;
+			next_entry->flags &= ~(ENTRY_FLAG_VALID);
 			return false;
 		}
 		
-		if ((string_find_index_from_left(name, STR("~1")) == -1 || !ctx->has_name) && name.count > 0) {
+		if (ctx->has_name && strings_match(next_entry->name, STR("One-Std"))) {
+			assert(!(next_entry->flags & ENTRY_FLAG_DIRECTORY));
+			next_entry->flags |= ENTRY_FLAG_UNHANDLED_HARD_LINK;
+		}
+		
+		if (name.count > 0 && !ctx->has_name) {
 			ctx->has_name = true;
 			
+			// @todo this should happen to save memory, but I think it was causing a bug
 			//u64 wasted = name_length - name.count;
 			//arena_pop(&vol->entry_names_arena, wasted);
 			
 			if (attr->parent_file_reference != 0) {
 				u64 parent_index = attr->parent_file_reference & 0x0000ffffffffffffULL;
+				// @todo Check parent sequence number at some point, because there may
+				// be garbage leftovers causing gnarly bugs here.
+				//u64 parent_sequence_number = attr->parent_file_reference >> 48;
 				assert(parent_index < vol->entry_count);
 				next_entry->parent = vol->entries + parent_index;
-				
 			} else {
-				next_entry->valid = false;
+				next_entry->flags &= ~(ENTRY_FLAG_VALID);
 			}
 			
 			next_entry->name = name;
@@ -929,12 +1086,19 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 			vol->root_entry = next_entry;
 		}
 		
+		/*if (attr->flags & FILE_FLAGS_System) {
+			next_entry->flags |= ENTRY_FLAG_SYSTEM;
+		}
 		
-	} else if (attr_header_base->type == ATTR_DATA && !next_entry->is_directory && !attr_named && next_entry->valid) {
-		next_entry->resident = resident;
+		if (attr->flags & FILE_FLAGS_Hidden) {
+			next_entry->flags |= ENTRY_FLAG_HIDDEN;
+		}*/
+		
+	} else if (attr_header_base->type == ATTR_DATA && !(next_entry->flags & ENTRY_FLAG_DIRECTORY) && !attr_named && (next_entry->flags & ENTRY_FLAG_VALID)) {
+		if (resident) next_entry->flags |= ENTRY_FLAG_RESIDENT;
 		if (resident) {
 			Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
-			if (attr_header->attribute_length > 0 && attr_header->attribute_length != next_entry->size) {
+			if (attr_header->attribute_length > 0) {
 				if (!next_entry->size) next_entry->size = attr_header->attribute_length;
 				void *attrib_data = (u8*)attr_header + attr_header->attribute_offset;
 				next_entry->data = arena_push_copy(&vol->entry_small_data_arena, attrib_data, next_entry->size);
@@ -956,6 +1120,7 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 	if (attr_header_base->type == ATTR_REPARSE_POINT) tm_scope("Reparse Point") {
 		if (resident) {
 			
+			
 			assert(!attr_named);
 			
 			Attribute_Header_Resident *attr_header = (Attribute_Header_Resident *)attr_header_base;
@@ -964,23 +1129,23 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 			
 			if ((attr->flags & REPARSE_Is_Microsoft) == REPARSE_Is_Microsoft) {
 				
-				REPARSE_DATA_BUFFER *data = (REPARSE_DATA_BUFFER *)attr->data_and_maybe_third_party_guid;
+				REPARSE_DATA_BUFFER *data = (REPARSE_DATA_BUFFER *)attr;
 				
 				u16 *path_base = 0;
+				
+				// @todo mount points to other drives
 				
 				if (attr->flags == (u32)IO_REPARSE_TAG_MOUNT_POINT) {
 					path_base = data->DUMMYUNIONNAME.MountPointReparseBuffer.PathBuffer;
 				} else if (attr->flags == (u32)IO_REPARSE_TAG_SYMLINK) {
-					path_base = data->DUMMYUNIONNAME.SymbolicLinkReparseBuffer.PathBuffer;
+					//path_base = data->DUMMYUNIONNAME.SymbolicLinkReparseBuffer.PathBuffer;
 				}
 				
 				if (path_base) {
-					//u64 substitute_name_offset = data->DUMMYUNIONNAME.MountPointReparseBuffer.SubstituteNameOffset;
-					//u64 substitute_byte_length = data->DUMMYUNIONNAME.MountPointReparseBuffer.SubstituteNameLength;
-					//u64 print_name_offset      = data->DUMMYUNIONNAME.MountPointReparseBuffer.PrintNameOffset;
-					//u64 print_byte_length = data->DUMMYUNIONNAME.MountPointReparseBuffer.PrintNameLength;
+					u64 substitute_name_offset = data->DUMMYUNIONNAME.MountPointReparseBuffer.SubstituteNameOffset;
+					u64 substitute_byte_length = data->DUMMYUNIONNAME.MountPointReparseBuffer.SubstituteNameLength;
 					
-					u16 *wide_substitute_path = path_base;
+					u16 *wide_substitute_path = path_base + substitute_name_offset/sizeof(WCHAR);
 					
 					File_Handle subf = 0;
 					tm_scope("CreateFileW")
@@ -992,7 +1157,20 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 					);
 					
 					if (subf == (void*)0xFFFFFFFFFFFFFFFF) {
-						next_entry->valid = false;
+						string name = string_allocate(get_temp(), substitute_byte_length);
+						name.count = (u64)WideCharToMultiByte(
+							CP_UTF8, 
+							0, 
+							(LPCWCH)wide_substitute_path, 
+							(int)(substitute_byte_length/sizeof(WCHAR)), 
+							(char*)name.data, 
+							(int)name.count, 
+							0, 
+							0
+						);
+						
+						print("Could not open %s\n", name);
+						next_entry->flags &= ~(ENTRY_FLAG_VALID);
 						return false;
 					}
 					
@@ -1008,25 +1186,23 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 					
 					Entry *link_to = vol->entries + file_record_index;
 					
-					next_entry->is_symlink = true;
+					next_entry->flags |= ENTRY_FLAG_ALIAS;
+					
 					next_entry->first_child = link_to;
 				}
 				
 			}
-			
-				//if (strings_match(STR("SDF"), next_entry->name))
-				//	__debugbreak();
 			
 		} else print("Unhandled: Non-resident reparse point.\n");
 	}
 	
 	// This attribute is not like other attributes so it will break stuff
 	if (attr_header_base->type == ATTR_LOGGED_UTILITY_STREAM) {
-		next_entry->ready = true; // @todo
 		return false; // break attribute looping
 	}
 	
 	if (attr_header_base->type == ATTR_ATTRIBUTE_LIST) tm_scope("Handle ATTRIBUTE_LIST") {
+		next_entry->flags |= ENTRY_FLAG_HAD_ATTRIBUTE_LIST;
 		if (attr_named) print("Unhandled: named attribute list\n");
 		else {
 			if (resident) {
@@ -1066,19 +1242,19 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 						
 							Entry *ext_entry = vol->entries + ext_file_record_index;
 							
-							if (!ext_entry->usa_applied) {
+							if (!(ext_entry->flags & ENTRY_FLAG_USA_APPLIED)) {
 								if (!apply_fixups(ext_rec, vol)) {
 									break;
 								}
 								
-								ext_entry->usa_applied = true;
+								ext_entry->flags |= ENTRY_FLAG_USA_APPLIED;
 							}
 							
 							assert(ext_rec->mft_record_number == ext_file_record_index);
 							
 							
 							if (ext_rec->sequence_number == expected_sequence_number) {
-								assert(!ext_entry->valid);
+								assert(!(ext_entry->flags & ENTRY_FLAG_VALID));
 								while ((u64)ext_attr_header < (u64)ext_rec + ext_rec->file_record_real_size && *(u32*)ext_attr_header != 0xFFFFFFFF) {
 									
 									if (ext_attr_header != attr_header_base && ext_attr_header->type == item->type && ext_attr_header->attribute_id == item->attribute_id) {
@@ -1109,7 +1285,10 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 							// Attribute list not in memory, postpone it until it is in memory.
 							
 							// We only care about these for now
-							if (item->type == ATTR_FILE_NAME || item->type == ATTR_DATA || item->type == ATTR_REPARSE_POINT) {
+							if (  item->type == ATTR_FILE_NAME || 
+									item->type == ATTR_STANDARD_INFORMATION || 
+									item->type == ATTR_DATA || 
+									item->type == ATTR_REPARSE_POINT) {
 								Scattered_Attribute *s 
 									= (Scattered_Attribute *)persistent_array_push_empty(ctx->scattered_attributes);
 								*s = (Scattered_Attribute){0};
@@ -1127,15 +1306,116 @@ bool process_attribute(Attribute_Processing_Context *ctx, Volume_Database *vol, 
 				
 			} else {
 				// @todo
-				static u64 n = 0;
-				print("Unhandled: non-resident attribute list (%u)\n", n);
-				n += 1;
+				next_entry->flags |= ENTRY_FLAG_UNHANDLED_NON_RESIDENT_ATTRIBUTE_LIST;
 				return false;
 			}
 		}
 	}
 	
 	return true;
+}
+
+void resolve_alias(Volume_Database *vol, Entry *entry, Entry **resolve_stack) {
+	if ((entry->flags & ENTRY_FLAG_ALIAS_RESOLVED)) return;
+	
+	(void)resolve_stack;
+	bool resolve_stack_was_initted_here = false;
+	if (!resolve_stack) {
+		// @speed
+		persistent_array_init((void**)&resolve_stack, sizeof(Entry*));
+		resolve_stack_was_initted_here = true;
+	}
+
+	for (u64 i = 0; i < persistent_array_count(resolve_stack); i += 1) {
+		Entry *being_resolved = resolve_stack[i];
+		assert(entry != being_resolved);
+	}
+	persistent_array_push_copy(resolve_stack, &entry);
+
+	Entry *link_to = entry->first_child; // first_child used for storing the link
+	assert(link_to);
+	entry->first_child = 0;
+
+	entry->data = link_to->data;
+	entry->size = link_to->size;
+	
+	// Copy children to make impostors
+	// We reuse all invalid entry memory before initializing impostors array.
+	
+	Child_Iterator it = (Child_Iterator) {0};
+	Entry *child;
+	Entry *last_impostor_stack[1024] = {0};
+	u64 last_impostor_count = 1;
+	s64 vsteps;
+	u64 hsteps;
+	while (get_next_child(&it, link_to, &child, &vsteps, &hsteps)) {
+		
+		
+		if ((child->flags & ENTRY_FLAG_ALIAS) && !(child->flags & ENTRY_FLAG_ALIAS_RESOLVED)) {
+			resolve_alias(vol, child, resolve_stack);
+		}
+		
+		// Avoid cycles in links
+		if (child == link_to || child == entry) {
+			abort_children_of_current_entry(&it);
+		}
+		
+		if (vsteps > 0) {
+			for (s64 j = 0; j < vsteps; j += 1) {
+				last_impostor_count += 1;
+			}
+		}
+		
+		// Climbing upwards will not revisit the directory
+		if (vsteps < 0) {
+			for (s64 j = vsteps; j < 0; j += 1) {
+				last_impostor_count -= 1;
+				last_impostor_stack[last_impostor_count] = 0;
+			}
+		}
+		
+		Entry *last_impostor = last_impostor_count ? last_impostor_stack[last_impostor_count-1] : 0;
+		
+		// Allocate the impostor
+		Entry *impostor;
+		if (vol->invalid_count) {
+			impostor = vol->first_invalid;
+			vol->first_invalid = vol->first_invalid->next_sibling;
+			vol->invalid_count -= 1;
+		} else {
+			if (!vol->impostors) {
+				persistent_array_init((void**)&vol->impostors, sizeof(Entry));
+			}
+			impostor = (Entry*)persistent_array_push_empty(vol->impostors);
+		}
+		
+		memcpy(impostor, child, sizeof(Entry));
+		
+		Entry *last_impostor_dir = last_impostor_count <= 1 ? entry : last_impostor_stack[last_impostor_count-2];
+		
+		impostor->parent = last_impostor_dir;
+		impostor->next_sibling = 0;
+		impostor->first_child = 0;
+		
+		if (child->parent != link_to) assert(strings_match(impostor->parent->name, child->parent->name));
+		
+		if (!last_impostor_dir->first_child) {
+			last_impostor_dir->first_child = impostor;
+		}
+		
+		if (last_impostor && last_impostor->parent == impostor->parent && !last_impostor->next_sibling) {
+			last_impostor->next_sibling = impostor;
+		}
+		
+		if (last_impostor_count)
+			last_impostor_stack[last_impostor_count-1] = impostor;
+	}
+	
+	entry->flags |= ENTRY_FLAG_ALIAS_RESOLVED;
+	
+	if (resolve_stack_was_initted_here) {
+		persistent_array_uninit(resolve_stack);
+	}
 }
 
 bool index_volume(string volume_name, Volume_Database *vol) {
@@ -1159,7 +1439,7 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 	_win_utf8_to_wide(vol_file_name, cpath, MAX_PATH_LENGTH*2);
 	DWORD flags = 0;
 #ifdef NO_CACHE
-	flags |= FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING;
+	flags |= FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS;
 #endif
 	File_Handle f = CreateFileW(
 		cpath, GENERIC_READ,
@@ -1334,7 +1614,7 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 	stream_ctx.record_range_count = record_range_count;
 	stream_ctx.file_records_per_read = BYTES_PER_READBACK/record_size;
 	u64 chunk_count = max_streaming_memory/(stream_ctx.file_records_per_read*record_size);
-	stream_ctx.max_file_record_count = chunk_count * stream_ctx.file_records_per_read;
+	stream_ctx.max_file_record_count = min(chunk_count * stream_ctx.file_records_per_read, vol->entry_count*record_size);
 	
 	Thread stream_thread;
 	sys_thread_init(&stream_thread, stream_mft_thread_proc, &stream_ctx);
@@ -1378,7 +1658,7 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 					
 					Entry *ext_entry = vol->entries + s->file_record_index;
 					
-					if (!ext_entry->usa_applied) {
+					if (!(ext_entry->flags & ENTRY_FLAG_USA_APPLIED)) {
 						if (!apply_fixups(ext_rec, vol)) {
 							// Unordered remove
 							if (i < count-1) {
@@ -1389,12 +1669,12 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 							
 							continue;
 						}
-						ext_entry->usa_applied = true;
+						ext_entry->flags |= ENTRY_FLAG_USA_APPLIED;
 					}
 					
 					assert(strings_match((string){4, ext_rec->magic}, STR("FILE"))); // @todo err
 					
-					next_entry->valid = true;
+					next_entry->flags |= ENTRY_FLAG_VALID;
 					
 					Attribute_Header_Base *ext_attr_header
 						= (Attribute_Header_Base *)((u8*)ext_rec + ext_rec->first_attribute_offset);
@@ -1445,17 +1725,18 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 			ctx->sequence_number = rec->sequence_number;
 			
 			Entry *next_entry = vol->entries + (total_processed_count + i);
+			
 			// Note: DO NOT ZERO HERE
-			assert(!next_entry->valid);
+			assert(!(next_entry->flags & ENTRY_FLAG_VALID));
 			assert(next_entry->name.count == 0);
 			
 			// @copypaste
-			if (!next_entry->usa_applied) {
+			if (!(next_entry->flags & ENTRY_FLAG_USA_APPLIED)) {
 				if (!apply_fixups(rec, vol)) {
 					continue;
 				}
 				
-				next_entry->usa_applied = true;
+				next_entry->flags |= ENTRY_FLAG_USA_APPLIED;
 			}
 			
 			// This is a dummy file record to hold ATTRIBUTE_LIST entries
@@ -1469,9 +1750,11 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 				continue;
 			}
 			
-			next_entry->valid = true;
+			next_entry->flags |= ENTRY_FLAG_VALID;
 			
-			next_entry->is_directory = (rec->flags & FILE_RECORD_FLAGS_DIRECTORY) != 0;
+			if ((rec->flags & FILE_RECORD_FLAGS_DIRECTORY) != 0) {
+				next_entry->flags |= ENTRY_FLAG_DIRECTORY;
+			}
 			Attribute_Header_Base *attr_header_base = (Attribute_Header_Base *)((u8*)rec + rec->first_attribute_offset);
 			
 			/////
@@ -1499,64 +1782,134 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 		chunk_index += 1;
 	}
 	
-	sys_thread_join(&stream_thread);
-	sys_thread_close(&stream_thread);
-	sys_semaphore_release(&stream_ctx.chunk_streamed_sem);
+	tm_scope("Wait stream thread")
+		sys_thread_join(&stream_thread);
 	
-	sys_unmap_pages(stream_ctx.buffer);
-	persistent_array_uninit(stream_ctx.chunk_sizes);
+	// @todo @speed this is an annoying waste of time (~50ms), should throw this on a transient thread, 
+	// or have a general purpose thread pool maybe. (Mostly unmapping stream buffer takes time)
+	tm_scope("Cleanup") {
+		tm_scope("thread_close")
+		sys_thread_close(&stream_thread);
+		tm_scope("semaphore_release")
+		sys_semaphore_release(&stream_ctx.chunk_streamed_sem);
+		
+		tm_scope("unmap")
+		sys_unmap_pages(stream_ctx.buffer);
+		tm_scope("array_uninit")
+		persistent_array_uninit(stream_ctx.chunk_sizes);
+		
+		tm_scope("array_uninit")
+		persistent_array_uninit(scattered_attributes);
+		tm_scope("array_uninit")
+		persistent_array_uninit(attribute_contexts);
+	}
 	
-	persistent_array_uninit(scattered_attributes);
-	persistent_array_uninit(attribute_contexts);
-	
+	tm_scope("Build tree")
 	for (u64 i = 0; i < vol->entry_count; i += 1) {
 		Entry *entry = vol->entries + i;
 		
-		if (!entry->valid) continue;
+		if (
+				strings_match(entry->name, STR("UIElementNames.xml")) &&
+				strings_match(entry->parent->name, STR("fr-CA")) &&
+				strings_match(entry->parent->parent->name, STR("Strings")) &&
+				strings_match(entry->parent->parent->parent->name, STR("VoiceAccessHost")) &&
+				strings_match(entry->parent->parent->parent->parent->name, STR("Core")) &&
+				strings_match(entry->parent->parent->parent->parent->parent->name, STR("n")) &&
+				strings_match(entry->parent->parent->parent->parent->parent->parent->name, STR("amd64_userexperience-core_31bf3856ad364e35_10.0.22621.5547_none_980aaa50465ebb77"))
+				) __debugbreak();
+		
+		if ((entry->flags & ENTRY_FLAG_ALIAS) && (entry->flags & ENTRY_FLAG_SYSTEM) && (entry->flags & ENTRY_FLAG_HIDDEN)) {
+			// ignore link files for backwards compatibility
+			entry->flags &= ~(ENTRY_FLAG_VALID);
+			entry->first_child = 0;
+		}
+		
+		if ((entry->flags & ENTRY_FLAG_ALIAS) && !(entry->flags & ENTRY_FLAG_VALID)) {
+			// We might have started parsing a alias and gotten a target which we
+			// set in first_child, but then the alias file record turned out to
+			// be invalid/garbage. So we need to zero those out here so we won't
+			// invalidate that possibly perfectly fine and valid child.
+			entry->first_child = 0;
+		}
+		
+		if (!(entry->flags & ENTRY_FLAG_VALID)) {
+			continue;
+		}
 		
 		Entry *p = entry->parent;
 		
 		if (entry == p) continue; // ".", or other metafiles, etc
 		
+		assert(!(p->flags & ENTRY_FLAG_ALIAS));
+		
 		if (!p->first_child) {
 			p->first_child = entry;
+			entry->next_sibling = 0;
 		} else {
 			entry->next_sibling = p->first_child;
 			p->first_child = entry;
 		}
 	}
 	
+	tm_scope("Invalidate children")
 	for (u64 i = 0; i < vol->entry_count; i += 1) {
 		Entry *entry = vol->entries + i;
 		
-		if (!entry->valid) continue;
-		
-		if (entry->is_symlink) {
-			string pretend_name = entry->name;
-			Entry *pretend_parent = entry->parent;
-			Entry *pretend_sibling = entry->next_sibling;
-			
-			Entry *link_to = entry->first_child;
-			
-			memcpy(entry, link_to, sizeof(Entry));
-			
-			entry->name = pretend_name;
-			entry->parent = pretend_parent;
-			entry->next_sibling = pretend_sibling;
-		}
-		
-		Entry *p = entry->parent;
-		
-		if (entry == p) continue; // ".", or other metafiles, etc
-		
-		// Sometimes there are weird duplicates of directory names.
-		// For now we work around this by ignoring empty directores
-		// (the duplicates seem to be empty)
-		// @todo @bug
-		if (entry->is_directory && !entry->first_child) {
-			entry->valid = false;
+		if (!(entry->flags & (ENTRY_FLAG_VALID))) {
+			Child_Iterator it = (Child_Iterator){0};
+			Entry *next;
+			while (get_next_child(&it, entry, &next, 0, 0)) {
+				
+				if (!(next->flags & ENTRY_FLAG_VALID)) {
+					abort_children_of_current_entry(&it);
+					continue;
+				}
+				
+				next->flags &= ~(ENTRY_FLAG_VALID);
+				
+				if (next->flags & ENTRY_FLAG_ALIAS) {
+					next->first_child = 0;
+				}
+			}
+			continue;
 		}
 	}
+	
+	Entry *last_invalid = 0;
+	tm_scope("Free-list invalids")
+	for (u64 i = 0; i < vol->entry_count; i += 1) {
+		
+		Entry *entry = vol->entries + i;
+		if (!(entry->flags & ENTRY_FLAG_VALID)) {
+			vol->invalid_count += 1;
+			*entry = (Entry){0};
+			
+			if (!vol->first_invalid) {
+				vol->first_invalid = entry;
+			} else {
+				last_invalid->next_sibling = entry;
+			}
+			
+			last_invalid = entry;
+		}
+	}
+	print("INVALID: %u\n", vol->invalid_count);
+	
+	tm_scope("Resolve links")
+	for (u64 i = 0; i < vol->entry_count; i += 1) {
+		Entry *entry = vol->entries + i;
+		
+		if (!(entry->flags & ENTRY_FLAG_VALID)) {
+			continue;
+		}
+		
+		if ((entry->flags & ENTRY_FLAG_ALIAS) && !(entry->flags & ENTRY_FLAG_ALIAS_RESOLVED)) {
+			resolve_alias(vol, entry, 0);
+		}
+	}
+	
+	u64 impostor_count = vol->impostors ? persistent_array_count(vol->impostors) : 0;
+	print("%s: %u, %u\n", vol->name, vol->invalid_count, impostor_count);
 	
 	free_arena(vol->scratch);
 	
@@ -1571,21 +1924,6 @@ bool index_volume(string volume_name, Volume_Database *vol) {
 		
 	}
 }*/
-
-string tprint_entry_full_path(string volume_label, Entry *entry) {
-	string dirpath = STR("");
-	
-	Entry *parent = entry->parent;
-	while (parent && parent != parent->parent && !strings_match(parent->name, STR("."))) {
-		dirpath = tprint("%s\\%s", parent->name, dirpath);
-		
-		parent = parent->parent;
-	}
-	
-	dirpath = tprint("%s:\\%s", volume_label, dirpath);
-	
-	return tprint("%s%s", dirpath, entry->name);
-}
 
 typedef enum Task_Kind {
 	TASK_INDEX_VOLUME,
@@ -1657,19 +1995,21 @@ Entry *full_path_to_entry_directory(Volume_Database vol, string absolute_path) {
 		}
 		search_dir_names[search_dir_name_count++] = STR(".");
 		
-		for (u64 i = 0; i < vol.entry_count; i += 1) {
+		u64 ext_impostor_count = vol.impostors ? persistent_array_count(vol.impostors) : 0;
+		
+		for (u64 i = 0; i < vol.entry_count + ext_impostor_count; i += 1) {
 			
 			u64 dir_match_count = 0;
 			
-			Entry *entry = &vol.entries[i];
+			Entry *entry = i >= vol.entry_count ? &vol.impostors[i] : &vol.entries[i];
 			
-			if (!entry->valid) continue;
-			if (!entry->is_directory) continue;
+			if (!(entry->flags & ENTRY_FLAG_VALID)) continue;
+			if (!(entry->flags & ENTRY_FLAG_DIRECTORY)) continue;
 			
 			Entry *next_dir = entry;
 			for (u64 j = 0; j < search_dir_name_count; j += 1) {
 				
-				if (!next_dir->valid) break;
+				if (!(next_dir->flags & ENTRY_FLAG_VALID)) break;
 				
 				if (strings_match(next_dir->name, search_dir_names[j])) {
 					dir_match_count += 1;
@@ -1808,7 +2148,7 @@ s64 work_thread_proc(Thread *t) {
 				p += 1;
 			}
 			
-			work->entry->was_searched = true; // @todo this will be true after 1st data run, but there will often be more data runs.
+			work->entry->flags |= ENTRY_FLAG_WAS_SEARCHED; // @todo this will be true after 1st data run, but there will often be more data runs.
 			
 			work->entry = (void*)0xFEEDFACEDEADBEEF;
 			sys_atomic_add_64(&ctx->buffered, (u64)-work->allocated_size);
@@ -1847,7 +2187,7 @@ s64 stream_file_data_thread_proc(Thread *t) {
 		_win_utf8_to_wide(vol_file_name, cpath, MAX_PATH_LENGTH*2);
 		DWORD flags = FILE_FLAG_OVERLAPPED;
 #ifdef NO_CACHE
-		flags |= FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING;
+		flags |= FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS;
 #endif
 		
 		File_Handle f = CreateFileW(
@@ -1887,14 +2227,12 @@ s64 stream_file_data_thread_proc(Thread *t) {
 			u64 entry_index = ctx->read_entry_count++;
 			Entry *entry = ctx->query->filtered_entries[entry_index];
 			
-			if (!entry->valid) {
-				//entry->was_searched = true;
+			if (!(entry->flags & ENTRY_FLAG_VALID)) {
 				continue;
 			}
 			
 			if (!entry->data) {
-				//entry->was_searched = true;
-				// @todo, some file entries are missing DATA attribute, and it seems the data is to be found elsewhere.
+				// @todo, investigate if entries missing data is a parsing error
 				continue;
 			}
 			
@@ -1908,13 +2246,13 @@ s64 stream_file_data_thread_proc(Thread *t) {
 			//}
 			
 			tm_scope("Resident entry")
-			if (entry->resident) {
+			if ((entry->flags & ENTRY_FLAG_RESIDENT)) {
 				
 				////////////
 				/// Resident file content (small, fits in 1kb file record)
 				
 				if (!entry->size) {
-					entry->was_searched = true;
+					entry->flags |= ENTRY_FLAG_WAS_SEARCHED;
 					continue;
 				}
 				
@@ -1970,7 +2308,6 @@ s64 stream_file_data_thread_proc(Thread *t) {
 				sys_atomic_add_64(&ctx->work_count, 1);
 				sys_semaphore_signal(&ctx->work_sem);
 				if (w1) {
-					//assert(false); // remove
 					memcpy(w1->data, data + w0->size, w1->size);
 					sys_atomic_add_64(&ctx->buffered, w1->allocated_size);
 					assert(ctx->buffered < max_streaming_memory);
@@ -2098,7 +2435,6 @@ s64 stream_file_data_thread_proc(Thread *t) {
 						sys_semaphore_signal(&ctx->work_sem); // signal w0
 						
 						if (w1) {
-							//assert(false); // remove
 							w1->ovl = (OVERLAPPED){0};
 							w1->ovl.Offset = (work_offset + w0->size) & 0xFFFFFFFF;
 							w1->ovl.OffsetHigh = (work_offset + w0->size) >> 32;
@@ -2148,57 +2484,6 @@ s64 stream_file_data_thread_proc(Thread *t) {
 	return 0;
 }
 
-
-typedef struct Child_Iterator {
-	Entry *last;
-	Entry *parent_stack[1024]; // Symlink reasons
-	u64 parent_count;
-} Child_Iterator;
-
-Entry *get_next_child(Child_Iterator *it, Entry *directory) {
-	Entry *cur = it->last;
-
-	if (!cur) {
-		it->parent_count = 0;
-		it->last = (directory && directory->first_child) ? directory->first_child : 0;
-		if (it->last) {
-			it->parent_stack[it->parent_count++] = directory;
-		}
-		return it->last;
-	}
-
-	if (cur->is_directory && cur->first_child) {
-		if (it->parent_count < (sizeof(it->parent_stack) / sizeof(it->parent_stack[0]))) {
-			it->parent_stack[it->parent_count++] = cur;
-			it->last = cur->first_child;
-			return it->last;
-		}
-	}
-
-	if (cur->next_sibling) {
-		it->last = cur->next_sibling;
-		return it->last;
-	}
-
-	while (it->parent_count > 0) {
-		Entry *parent = it->parent_stack[it->parent_count - 1];
-		it->parent_count--;
-
-		if (parent == directory) {
-			it->last = 0;
-			return 0;
-		}
-
-		if (parent->next_sibling) {
-			it->last = parent->next_sibling;
-			return it->last;
-		}
-	}
-
-	it->last = 0;
-	return 0;
-}
-
 void query_volume(Query *query, Volume_Database vol, Entry *directory, string *filters, u64 filter_count, string *search_terms, u64 search_term_count, bool *done_flag) {
 	f64 start_time = sys_get_seconds_monotonic();
 	*query = (Query) {0};
@@ -2241,23 +2526,27 @@ void query_volume(Query *query, Volume_Database vol, Entry *directory, string *f
 	}
 	
 	timestamp_begin(STR("Find children which match filter"));
-	
 	if (filter_count == 0) {
 		Child_Iterator it = (Child_Iterator){0};
 		Entry *entry;
-		while ((entry = get_next_child(&it, directory))) {
-			if (entry->is_directory) continue; // @todo Display directories when searching file names, but differently
-			entry->was_searched = false;
+		while (get_next_child(&it, directory, &entry, 0, 0)) {
+			if (entry->flags & ENTRY_FLAG_DIRECTORY) continue; // @todo Display directories when searching file names, but differently
+			
+			if (entry->size > 0 && entry->data) {
+				entry->flags &= ~(ENTRY_FLAG_WAS_SEARCHED);
+ 			} else {
+				entry->flags |= (ENTRY_FLAG_WAS_SEARCHED);
+ 			}
 			persistent_array_push_copy(query->filtered_entries, &entry);
 			sys_semaphore_signal(&query->ctx.found_entry_sem);
 		}
 	} else {
 		Child_Iterator it = (Child_Iterator){0};
-		Entry *entry;
 		
-		while ((entry = get_next_child(&it, directory))) {
-			
-			if (!entry->valid) continue;
+		File_Handle ff = sys_open_file(STR("nowgrep.txt"), FILE_OPEN_RESET | FILE_OPEN_CREATE | FILE_OPEN_WRITE);
+		Entry *entry;
+		while (get_next_child(&it, directory, &entry, 0, 0)) {
+			assert(entry->flags & ENTRY_FLAG_VALID);
 			
 			bool any_match = false;
 			
@@ -2269,7 +2558,7 @@ void query_volume(Query *query, Volume_Database vol, Entry *directory, string *f
 				bool suffix_wildcard = filter.data[filter.count-1] == '*';
 				
 				if (strings_match(string_trim(filter), STR("*"))) {
-					if (entry->is_directory) continue; // @todo Display directories when searching file names, but differently
+					if (entry->flags & ENTRY_FLAG_DIRECTORY) continue; // @todo Display directories when searching file names, but differently
 					any_match  = true;
 					break;
 				}
@@ -2316,12 +2605,21 @@ void query_volume(Query *query, Volume_Database vol, Entry *directory, string *f
 			}
 			
 			if (any_match) {
-				entry->was_searched = false;
+				if (entry->data && entry->size) {
+					entry->flags &= ~(ENTRY_FLAG_WAS_SEARCHED);
+				} else {
+					entry->flags |= (ENTRY_FLAG_WAS_SEARCHED);
+				}
 				persistent_array_push_copy(query->filtered_entries, &entry);
 				sys_semaphore_signal(&query->ctx.found_entry_sem);
+				
+				
+				string paaaath = tprint_entry_full_path(vol.name, entry);
+				fprint(ff, "%s\n", paaaath);
 			}
 			
 		}
+		sys_close(ff);
 	}
 	timestamp_end(STR("Find children which match filter"));
 	
@@ -2561,10 +2859,11 @@ int main(int argc, char **argv) {
 
 int gui_callback(struct nk_context *ctx)
 {
-	static char dir[MAX_PATH]         = "C:/The-Forge/Examples_3/Unit_Tests/PC_VS2019/x64/Debug/09_LightShadowPlayground/SDF";
-	//static char dir[MAX_PATH]         = "C:";
+	//static char dir[MAX_PATH]         = "C:/Users/charl/AppData/Local";
+	static char dir[MAX_PATH]         = "C:";
 	static char filter[MAX_FILTER]    = "*.c, *.cpp, *.h, *.hpp, *.txt, *.json, *.xml, *.html";
-	static char search_str[MAX_SEARCH]= "Hello";
+	//static char filter[MAX_FILTER]    = "*";
+	static char search_str[MAX_SEARCH]= "";
 	static string search_term;
 	static Query queries[1024];
 	static u64 query_count = 0;
@@ -2683,7 +2982,7 @@ int gui_callback(struct nk_context *ctx)
 		Query *query = &queries[0];
 		
 		for (u64 i = 0; i < persistent_array_count(query->filtered_entries); i += 1) {
-			if (query->filtered_entries[i]->was_searched) {
+			if (query->filtered_entries[i]->flags & ENTRY_FLAG_WAS_SEARCHED) {
 				files_searched += 1;
 			}
 		}
@@ -2757,7 +3056,7 @@ int gui_callback(struct nk_context *ctx)
 				}
 				for (u64 j = 0; j < persistent_array_count(query->filtered_entries); ++j) {
 					Entry *entry = query->filtered_entries[j];
-					if (!entry->was_searched) {
+					if (!(entry->flags & ENTRY_FLAG_WAS_SEARCHED)) {
 						string name = tprint_entry_full_path(query->vol.name, entry);
 						nk_bool is_sel = (selected == (s64)j);
 						if (nk_selectable_text(ctx, (char*)name.data, (int)name.count, NK_TEXT_LEFT, &is_sel)) {
@@ -2766,12 +3065,20 @@ int gui_callback(struct nk_context *ctx)
 							}
 							selected = (s64)j;
 						}
-						if (entry->data == 0) {
+						if (entry->flags == ENTRY_FLAG_UNHANDLED_NON_RESIDENT_ATTRIBUTE_LIST) {
+							nk_text(ctx, "<Non-resident attribute list>", (int)c_style_strlen("<Non-resident attribute list>"), NK_TEXT_LEFT);
+						} else if (entry->flags == ENTRY_FLAG_UNHANDLED_DATALESS) {
 							nk_text(ctx, "<Dataless>", (int)c_style_strlen("<Dataless>"), NK_TEXT_LEFT);
-						} else if (!entry->valid) {
+						} else if (entry->flags == ENTRY_FLAG_UNHANDLED_HARD_LINK) {
+							nk_text(ctx, "<Hard-link>", (int)c_style_strlen("<Hard-link>"), NK_TEXT_LEFT);
+						} else if (!(entry->flags & ENTRY_FLAG_VALID)) {
 							nk_text(ctx, "<Invalid>", (int)c_style_strlen("<Invalid>"), NK_TEXT_LEFT);
-						} else {
+						} else if ((entry->flags & ENTRY_FLAG_HAD_ATTRIBUTE_LIST)) {
+							nk_text(ctx, "<Had attribute list>", (int)c_style_strlen("<Had attribute list>"), NK_TEXT_LEFT);
+						} else if (entry->size != 0) {
 							nk_text(ctx, "<Queued for searching...>", (int)c_style_strlen("<Queued for searching...>"), NK_TEXT_LEFT);
+						} else {
+							nk_text(ctx, "<Empty>", (int)c_style_strlen("<Empty>"), NK_TEXT_LEFT);
 						}
 					}
 				}
